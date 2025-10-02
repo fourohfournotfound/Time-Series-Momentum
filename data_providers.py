@@ -9,7 +9,7 @@ ready to use within the momentum backtest.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 import requests
