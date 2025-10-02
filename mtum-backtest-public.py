@@ -177,160 +177,163 @@ def main() -> None:
             with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
                 list(executor.map(_prefetch, all_tickers))
 
-        full_data_list = []
-        top_decile_list = []
-        bot_decile_list = []
-        times = []
-
         rebalance_gap = timedelta(days=int(args.rebalance_frequency_days))
+        feature_window = 252
 
-        for idx, month in enumerate(analysis_months):
-            month_str = month.strftime("%Y-%m-%d")
-            next_month = months_index[idx + 1]
-            next_month_str = next_month.strftime("%Y-%m-%d")
-            start_date_str = (month - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-            last_month_str = (month - rebalance_gap).strftime("%Y-%m-%d")
+        benchmark_data = benchmark_data.sort_values("timestamp").drop_duplicates(subset="date", keep="last")
+        benchmark_data["date"] = pd.to_datetime(benchmark_data["date"])
+        benchmark_data = benchmark_data.sort_values("date").reset_index(drop=True)
+        benchmark_data["benchmark_pct_change"] = benchmark_data["c"].pct_change().fillna(0) * 100
 
-            monthly_universe = universe[universe["date"] == month].drop_duplicates(subset=["ticker"], keep="last")
-            tickers = monthly_universe["ticker"].drop_duplicates().values
+        universe_by_month = {
+            month: set(
+                universe.loc[universe["date"] == month, "ticker"].drop_duplicates().values
+            )
+            for month in analysis_months
+        }
 
-            if len(tickers) == 0:
+        analysis_months_index = analysis_months
+        exit_months_index = months_index[1:]
+        feature_anchor_index = analysis_months - rebalance_gap
+        analysis_months_array = analysis_months_index.to_numpy()
+        exit_months_array = exit_months_index.to_numpy()
+
+        all_monthly_results = []
+
+        for ticker in all_tickers:
+            try:
+                history = load_history(ticker)
+            except Exception as err:
+                print(f"{ticker} download failed: {err}")
                 continue
 
-            monthly_ticker_data = []
-            start_time = datetime.now()
-
-            for ticker in tickers:
-                try:
-                    history = load_history(ticker)
-                except Exception as err:
-                    print(f"{ticker} download failed: {err}")
-                    continue
-
-                if history.empty:
-                    continue
-
-                history = history.sort_values("timestamp")
-
-                lookback_mask = (history["date"] >= start_date_str) & (history["date"] < last_month_str)
-                twelve_minus_one = history.loc[lookback_mask].copy().tail(252)
-
-                if len(twelve_minus_one) < 252:
-                    continue
-
-                twelve_minus_one["year"] = twelve_minus_one["timestamp"].dt.year
-                twelve_minus_one["month"] = twelve_minus_one["timestamp"].dt.month
-
-                twelve_minus_one_return = round(
-                    ((twelve_minus_one["c"].iloc[-1] - twelve_minus_one["c"].iloc[0]) / twelve_minus_one["c"].iloc[0]) * 100,
-                    2,
-                )
-
-                benchmark_slice = benchmark_data[(benchmark_data["date"] >= twelve_minus_one["date"].iloc[0]) & (benchmark_data["date"] <= twelve_minus_one["date"].iloc[-1])].copy()
-                benchmark_and_underlying = pd.merge(
-                    benchmark_slice[["c", "date"]],
-                    twelve_minus_one[["c", "date"]],
-                    on="date",
-                    how="inner",
-                    suffixes=("_benchmark", "_ticker"),
-                )
-
-                if len(benchmark_and_underlying) < 2:
-                    continue
-
-                benchmark_and_underlying["benchmark_pct_change"] = (
-                    benchmark_and_underlying["c_benchmark"].pct_change().fillna(0) * 100
-                )
-                benchmark_and_underlying["ticker_pct_change"] = (
-                    benchmark_and_underlying["c_ticker"].pct_change().fillna(0) * 100
-                )
-
-                variance_benchmark = np.var(benchmark_and_underlying["benchmark_pct_change"])
-                if variance_benchmark == 0:
-                    continue
-
-                covariance_matrix = np.cov(
-                    benchmark_and_underlying["ticker_pct_change"],
-                    benchmark_and_underlying["benchmark_pct_change"],
-                )
-                covariance_ticker_benchmark = covariance_matrix[0, 1]
-                beta = covariance_ticker_benchmark / variance_benchmark
-
-                ticker_return_over_period = round(
-                    (
-                        (
-                            benchmark_and_underlying["c_ticker"].iloc[-1]
-                            - benchmark_and_underlying["c_ticker"].iloc[0]
-                        )
-                        / benchmark_and_underlying["c_ticker"].iloc[0]
-                    )
-                    * 100,
-                    2,
-                )
-
-                std_of_returns = benchmark_and_underlying["ticker_pct_change"].std() * np.sqrt(252)
-                if std_of_returns == 0:
-                    continue
-
-                sharpe = ticker_return_over_period / std_of_returns
-                theo_expected = beta * sharpe
-
-                forward_mask = (history["date"] >= month_str) & (history["date"] <= next_month_str)
-                next_period = history.loc[forward_mask].copy()
-                if len(next_period) < 2:
-                    continue
-
-                next_period_returns = round(
-                    ((next_period["c"].iloc[-1] - next_period["c"].iloc[0]) / next_period["c"].iloc[0]) * 100,
-                    2,
-                )
-
-                ticker_frame = pd.DataFrame(
-                    [
-                        {
-                            "entry_date": month_str,
-                            "exit_date": next_month_str,
-                            "ticker": ticker,
-                            "beta": beta,
-                            "sharpe": sharpe,
-                            "12-1_return": ticker_return_over_period,
-                            "mom_score": theo_expected,
-                            "forward_returns": next_period_returns,
-                        }
-                    ]
-                )
-                monthly_ticker_data.append(ticker_frame)
-
-            if not monthly_ticker_data:
+            if history.empty:
                 continue
 
-            monthly_data = pd.concat(monthly_ticker_data, ignore_index=True)
-            top_decile = monthly_data.sort_values(by="mom_score", ascending=False).head(10)
-            bot_decile = monthly_data.sort_values(by="mom_score", ascending=True).head(10)
+            history = history.sort_values("timestamp").drop_duplicates(subset="date", keep="last")
+            history["date"] = pd.to_datetime(history["date"])
 
-            full_data_list.append(monthly_data)
-            top_decile_list.append(top_decile)
-            bot_decile_list.append(bot_decile)
+            merged = pd.merge(
+                history[["date", "c"]].rename(columns={"c": "c_ticker"}),
+                benchmark_data[["date", "c", "benchmark_pct_change"]].rename(
+                    columns={"c": "c_benchmark"}
+                ),
+                on="date",
+                how="inner",
+                sort=True,
+            )
 
-            end_time = datetime.now()
-            seconds_to_complete = (end_time - start_time).total_seconds()
-            times.append(seconds_to_complete)
+            if len(merged) < feature_window:
+                continue
 
-            iteration = round(((idx + 1) / len(analysis_months)) * 100, 2)
-            iterations_remaining = len(analysis_months) - (idx + 1)
-            average_time = np.mean(times)
-            eta = datetime.now() + timedelta(seconds=int(average_time * iterations_remaining)) if times else datetime.now()
-            time_remaining = eta - datetime.now()
-            print(f"{iteration}% complete, {time_remaining} left, ETA: {eta}")
+            merged = merged.sort_values("date").reset_index(drop=True)
+            merged["ticker_pct_change"] = merged["c_ticker"].pct_change().fillna(0) * 100
 
-        # end for loop
+            rolling_cov = merged["ticker_pct_change"].rolling(window=feature_window, min_periods=feature_window).cov(
+                merged["benchmark_pct_change"]
+            )
+            benchmark_var = merged["benchmark_pct_change"].rolling(window=feature_window, min_periods=feature_window).var()
+            beta = rolling_cov.divide(benchmark_var).replace([np.inf, -np.inf], np.nan)
 
-        if not full_data_list:
+            total_return = merged["c_ticker"].pct_change(periods=feature_window - 1) * 100
+            rolling_std = merged["ticker_pct_change"].rolling(window=feature_window, min_periods=feature_window).std()
+            rolling_std = rolling_std * np.sqrt(252)
+            rolling_std = rolling_std.replace(0, np.nan)
+            sharpe = total_return.divide(rolling_std)
+            sharpe = sharpe.replace([np.inf, -np.inf], np.nan)
+
+            mom_score = beta * sharpe
+
+            metrics = (
+                pd.DataFrame(
+                    {
+                        "date": merged["date"],
+                        "beta": beta,
+                        "sharpe": sharpe,
+                        "12-1_return": total_return,
+                        "mom_score": mom_score,
+                    }
+                )
+                .set_index("date")
+                .sort_index()
+            )
+
+            metrics = metrics.reindex(feature_anchor_index, method="ffill")
+
+            price_series = history.set_index("date")["c"].sort_index()
+            price_dates = price_series.index.to_numpy()
+            price_values = price_series.to_numpy()
+
+            if len(price_dates) == 0:
+                continue
+
+            entry_idx = np.searchsorted(price_dates, analysis_months_array, side="left")
+            exit_idx = np.searchsorted(price_dates, exit_months_array, side="right") - 1
+
+            valid_mask = (
+                (entry_idx < len(price_dates))
+                & (exit_idx >= 0)
+                & (exit_idx < len(price_dates))
+                & (exit_idx > entry_idx)
+            )
+
+            forward_returns = np.full(len(analysis_months_array), np.nan)
+
+            if valid_mask.any():
+                valid_entry_idx = entry_idx[valid_mask]
+                valid_exit_idx = exit_idx[valid_mask]
+                entry_subset = price_values[valid_entry_idx]
+                exit_subset = price_values[valid_exit_idx]
+                nonzero_entry = entry_subset != 0
+                result_returns = np.full(valid_entry_idx.shape, np.nan)
+                result_returns[nonzero_entry] = (
+                    (exit_subset[nonzero_entry] - entry_subset[nonzero_entry]) / entry_subset[nonzero_entry]
+                ) * 100
+
+                forward_returns[valid_mask] = result_returns
+
+            monthly_results = pd.DataFrame(
+                {
+                    "entry_date": analysis_months_array,
+                    "exit_date": exit_months_array,
+                    "ticker": ticker,
+                    "beta": metrics["beta"].to_numpy(),
+                    "sharpe": metrics["sharpe"].to_numpy(),
+                    "12-1_return": metrics["12-1_return"].to_numpy(),
+                    "mom_score": metrics["mom_score"].to_numpy(),
+                    "forward_returns": forward_returns,
+                }
+            )
+
+            in_universe = np.array([ticker in universe_by_month.get(month, set()) for month in analysis_months])
+            monthly_results = monthly_results[in_universe]
+            monthly_results = monthly_results.dropna(
+                subset=["beta", "sharpe", "12-1_return", "mom_score", "forward_returns"]
+            )
+
+            if monthly_results.empty:
+                continue
+
+            monthly_results["entry_date"] = pd.to_datetime(monthly_results["entry_date"]).dt.strftime("%Y-%m-%d")
+            monthly_results["exit_date"] = pd.to_datetime(monthly_results["exit_date"]).dt.strftime("%Y-%m-%d")
+
+            all_monthly_results.append(monthly_results)
+
+        if not all_monthly_results:
             raise ValueError("No data collected for any month; confirm ticker universe and data availability")
 
-        full_dataset = pd.concat(full_data_list, ignore_index=True)
-        top_decile_dataset = pd.concat(top_decile_list, ignore_index=True)
-        bot_decile_dataset = pd.concat(bot_decile_list, ignore_index=True)
+        full_dataset = pd.concat(all_monthly_results, ignore_index=True)
+        full_dataset = full_dataset.sort_values(["entry_date", "mom_score"], ascending=[True, False])
+        top_decile_dataset = (
+            full_dataset.sort_values("mom_score", ascending=False)
+            .groupby("entry_date", group_keys=False)
+            .head(10)
+        )
+        bot_decile_dataset = (
+            full_dataset.sort_values("mom_score", ascending=True)
+            .groupby("entry_date", group_keys=False)
+            .head(10)
+        )
 
         covered_dates = full_dataset["entry_date"].drop_duplicates().values
 
