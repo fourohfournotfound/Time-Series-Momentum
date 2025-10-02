@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Dict
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,12 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", default="data-cache", help="Directory used to persist downloaded bars")
     parser.add_argument("--force-refresh", action="store_true", help="Ignore cached data and redownload from the API")
     parser.add_argument("--prefetch", action="store_true", help="Download all ticker histories up-front")
-    parser.add_argument(
-        "--max-workers",
-        type=int,
-        default=200,
-        help="Batch size used during prefetching (Alpaca batches up to 200 symbols per request)",
-    )
+    parser.add_argument("--max-workers", type=int, default=4, help="Workers for optional prefetching")
     parser.add_argument("--lookback-window-days", type=int, default=425, help="Lookback window used for features")
     parser.add_argument("--rebalance-frequency-days", type=int, default=30, help="Gap between rebalances")
     parser.add_argument("--forward-buffer-days", type=int, default=30, help="Forward buffer for return calculation")
@@ -92,63 +88,24 @@ def history_loader(
     start: str,
     end: str,
     force_refresh: bool,
-):
+) -> Dict[str, pd.DataFrame]:
     cache: Dict[str, pd.DataFrame] = {}
-    required_columns = ["t", "timestamp", "date", "ticker", "o", "h", "l", "c", "v", "vw", "n"]
-
-    def load_histories(tickers: Sequence[str]) -> Dict[str, pd.DataFrame]:
-        results: Dict[str, pd.DataFrame] = {}
-        missing: list[str] = []
-
-        for ticker in tickers:
-            if ticker in cache and not force_refresh:
-                results[ticker] = cache[ticker]
-                continue
-
-            cache_path = cache_dir / cache_key(provider_name, ticker, start, end)
-            if cache_path.exists() and not force_refresh:
-                data = pd.read_pickle(cache_path)
-                cache[ticker] = data
-                results[ticker] = data
-            else:
-                missing.append(ticker)
-
-        if missing:
-            fetched: Dict[str, pd.DataFrame] = {}
-            if getattr(provider, "supports_batch", False):
-                batch_limit = getattr(provider, "batch_limit", 200)
-                for start_idx in range(0, len(missing), batch_limit):
-                    batch = missing[start_idx : start_idx + batch_limit]
-                    fetched.update(provider.get_daily_bars_multi(batch, start, end))
-            else:
-                fetched = provider.get_daily_bars_multi(missing, start, end)
-
-            for ticker in missing:
-                data = fetched.get(ticker)
-                if data is None:
-                    data = pd.DataFrame(columns=required_columns)
-                if not data.empty:
-                    cache_path = cache_dir / cache_key(provider_name, ticker, start, end)
-                    cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    data.to_pickle(cache_path)
-                elif any(column not in data.columns for column in required_columns):
-                    data = pd.DataFrame(columns=required_columns)
-                cache[ticker] = data
-                results[ticker] = data
-
-        for ticker in tickers:
-            if ticker not in results:
-                empty_frame = pd.DataFrame(columns=required_columns)
-                cache[ticker] = empty_frame
-                results[ticker] = empty_frame
-
-        return results
 
     def load_history(ticker: str) -> pd.DataFrame:
-        histories = load_histories([ticker])
-        return histories.get(ticker, pd.DataFrame())
+        if ticker in cache and not force_refresh:
+            return cache[ticker]
+        cache_path = cache_dir / cache_key(provider_name, ticker, start, end)
+        if cache_path.exists() and not force_refresh:
+            cache[ticker] = pd.read_pickle(cache_path)
+            return cache[ticker]
+        data = provider.get_daily_bars(ticker, start, end)
+        if not data.empty:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            data.to_pickle(cache_path)
+        cache[ticker] = data
+        return data
 
-    return cache, load_history, load_histories
+    return cache, load_history
 
 
 def fetch_benchmark(
@@ -198,9 +155,7 @@ def main() -> None:
         global_end = global_end_dt.strftime("%Y-%m-%d")
 
         provider_name = args.provider
-        _, _, load_histories = history_loader(
-            provider_name, provider, cache_dir, global_start, global_end, args.force_refresh
-        )
+        cache, load_history = history_loader(provider_name, provider, cache_dir, global_start, global_end, args.force_refresh)
 
         benchmark_start = min(pd.Timestamp("2017-01-01"), global_start_dt).strftime("%Y-%m-%d")
         benchmark_data = fetch_benchmark(provider, cache_dir, provider_name, args.force_refresh, benchmark_start, global_end)
@@ -211,20 +166,16 @@ def main() -> None:
 
         all_tickers = universe["ticker"].drop_duplicates().values
         if args.prefetch:
-            print(f"Prefetching {len(all_tickers)} tickers...")
+            print(f"Prefetching {len(all_tickers)} tickers with {args.max_workers} workers...")
 
-            if getattr(provider, "supports_batch", False):
-                batch_limit = getattr(provider, "batch_limit", 200)
-                batch_size = min(batch_limit, max(1, args.max_workers))
-            else:
-                batch_size = 1
-
-            for start_idx in range(0, len(all_tickers), batch_size):
-                batch = all_tickers[start_idx : start_idx + batch_size]
+            def _prefetch(symbol: str) -> None:
                 try:
-                    load_histories(batch)
+                    load_history(symbol)
                 except Exception as exc:  # pragma: no cover - diagnostic output only
-                    print(f"Failed to prefetch batch {start_idx // batch_size + 1}: {exc}")
+                    print(f"Failed to prefetch {symbol}: {exc}")
+
+            with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+                list(executor.map(_prefetch, all_tickers))
 
         full_data_list = []
         top_decile_list = []
@@ -249,11 +200,11 @@ def main() -> None:
             monthly_ticker_data = []
             start_time = datetime.now()
 
-            histories = load_histories(tickers)
-
-            for ticker, history in histories.items():
-                if not isinstance(history, pd.DataFrame):
-                    print(f"{ticker} download failed: unexpected data type {type(history)}")
+            for ticker in tickers:
+                try:
+                    history = load_history(ticker)
+                except Exception as err:
+                    print(f"{ticker} download failed: {err}")
                     continue
 
                 if history.empty:

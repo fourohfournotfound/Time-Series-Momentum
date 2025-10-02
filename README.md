@@ -29,13 +29,9 @@ automatic caching so that you only download each symbol once. Key options:
 - Environment variables (`POLYGON_API_KEY`, `ALPACA_API_KEY`,
   `ALPACA_SECRET_KEY`) or CLI flags to pass credentials securely.
 - `--cache-dir` and `--force-refresh` to manage on-disk caching of daily bars.
-- `--prefetch` to warm the cache up-front. Alpaca requests now batch up to
-  200 symbols per call so you can hydrate the cache much faster than
-  previously possible.
-- `--max-workers` controls the Alpaca batch size if you need to stay below the
-  default limit.
+- `--prefetch` with `--max-workers` to download histories in parallel when
+  API limits allow.
 
 The backtest pulls the full lookback window for every symbol a single time and
-reuses it across monthly iterations. Runtime is typically constrained by API
-throughput rather than the daily bar frequency, so batching requests with
-Alpaca or caching Polygon downloads provides the biggest speedups.
+reuses it across monthly iterations, dramatically reducing redundant API
+requests.

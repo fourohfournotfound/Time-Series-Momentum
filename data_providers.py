@@ -44,8 +44,6 @@ def _build_retry_adapter(config: _ClientConfig) -> HTTPAdapter:
 class BaseDataClient:
     """Base HTTP client with retry configuration."""
 
-    supports_batch: bool = False
-
     def __init__(self, session: Optional[requests.Session] = None, *, config: Optional[_ClientConfig] = None) -> None:
         self.session = session or requests.Session()
         self.config = config or _ClientConfig()
@@ -55,14 +53,6 @@ class BaseDataClient:
 
     def close(self) -> None:
         self.session.close()
-
-    def get_daily_bars_multi(self, tickers: Sequence[str], start: str, end: str) -> Dict[str, pd.DataFrame]:
-        """Default batch loader that falls back to sequential requests."""
-
-        results: Dict[str, pd.DataFrame] = {}
-        for ticker in tickers:
-            results[ticker] = self.get_daily_bars(ticker, start, end)
-        return results
 
 
 class PolygonAggsClient(BaseDataClient):
@@ -100,7 +90,7 @@ class PolygonAggsClient(BaseDataClient):
         results = payload.get("results", [])
 
         if not results:
-            return empty_bar_frame()
+            return pd.DataFrame(columns=["t", "o", "h", "l", "c", "v", "vw", "n", "timestamp", "date"])
 
         frame = pd.DataFrame(results)
         frame["timestamp"] = pd.to_datetime(frame["t"], unit="ms", utc=True).dt.tz_convert("America/New_York")
@@ -110,28 +100,10 @@ class PolygonAggsClient(BaseDataClient):
         return frame[cols].sort_values("timestamp").reset_index(drop=True)
 
 
-def empty_bar_frame() -> pd.DataFrame:
-    return pd.DataFrame(columns=["t", "o", "h", "l", "c", "v", "vw", "n", "timestamp", "date", "ticker"])
-
-
-def _normalize_bars(bars: List[Dict], ticker: str) -> pd.DataFrame:
-    if not bars:
-        return empty_bar_frame()
-
-    frame = pd.DataFrame(bars)
-    frame["timestamp"] = pd.to_datetime(frame["t"], utc=True).dt.tz_convert("America/New_York")
-    frame["date"] = frame["timestamp"].dt.strftime("%Y-%m-%d")
-    frame["ticker"] = ticker
-    cols = ["t", "timestamp", "date", "ticker", "o", "h", "l", "c", "v", "vw", "n"]
-    return frame[cols].sort_values("timestamp").reset_index(drop=True)
-
-
 class AlpacaBarsClient(BaseDataClient):
     """Client for Alpaca Markets historical daily bars."""
 
     base_url = "https://data.alpaca.markets/v2"
-    supports_batch = True
-    batch_limit = 200
 
     def __init__(
         self,
@@ -166,7 +138,7 @@ class AlpacaBarsClient(BaseDataClient):
         url = f"{self.base_url}/stocks/{ticker}/bars"
         page_token: Optional[str] = None
 
-        frames: List[Dict] = []
+        frames = []
 
         while True:
             if page_token:
@@ -177,65 +149,19 @@ class AlpacaBarsClient(BaseDataClient):
             bars = payload.get("bars", [])
             if not bars:
                 break
-            if isinstance(bars, dict):
-                # In case the API ever returns a mapping keyed by ticker for single requests.
-                bars = [bar for bar_list in bars.values() for bar in bar_list]
-            frames.extend(bars)
+            frame = pd.DataFrame(bars)
+            frames.append(frame)
             page_token = payload.get("next_page_token")
             if not page_token:
                 break
 
         if not frames:
-            return empty_bar_frame()
+            return pd.DataFrame(columns=["t", "o", "h", "l", "c", "v", "vw", "n", "timestamp", "date"])
 
-        return _normalize_bars(frames, ticker)
-
-    def get_daily_bars_multi(self, tickers: Sequence[str], start: str, end: str) -> Dict[str, pd.DataFrame]:
-        unique_tickers = sorted({ticker.upper() for ticker in tickers})
-        if not unique_tickers:
-            return {}
-
-        params: Dict[str, str] = {
-            "timeframe": "1Day",
-            "adjustment": "all",
-            "start": f"{start}T00:00:00Z",
-            "end": f"{end}T23:59:59Z",
-            "limit": "10000",
-            "feed": self.data_feed,
-            "symbols": ",".join(unique_tickers),
-        }
-
-        url = f"{self.base_url}/stocks/bars"
-        page_token: Optional[str] = None
-        aggregated: Dict[str, List[Dict]] = {symbol: [] for symbol in unique_tickers}
-
-        while True:
-            request_params = params.copy()
-            if page_token:
-                request_params["page_token"] = page_token
-            response = self.session.get(url, params=request_params, timeout=self.config.timeout)
-            response.raise_for_status()
-            payload = response.json()
-            bars_payload = payload.get("bars", {})
-
-            if isinstance(bars_payload, dict):
-                iterator = bars_payload.items()
-            else:
-                iterator = []
-                for bar in bars_payload:
-                    symbol = bar.get("S") or bar.get("symbol") or bar.get("ticker")
-                    if not symbol:
-                        continue
-                    iterator.append((symbol, [bar]))
-
-            for symbol, bar_list in iterator:
-                if symbol not in aggregated:
-                    aggregated[symbol] = []
-                aggregated[symbol].extend(bar_list)
-
-            page_token = payload.get("next_page_token")
-            if not page_token:
-                break
-
-        return {symbol: _normalize_bars(bars, symbol) for symbol, bars in aggregated.items() if bars}
+        frame = pd.concat(frames, ignore_index=True)
+        frame["timestamp"] = pd.to_datetime(frame["t"], utc=True).dt.tz_convert("America/New_York")
+        frame["date"] = frame["timestamp"].dt.strftime("%Y-%m-%d")
+        frame["ticker"] = ticker
+        cols = ["t", "timestamp", "date", "ticker", "o", "h", "l", "c", "v", "vw", "n"]
+        return frame[cols].sort_values("timestamp").reset_index(drop=True)
 
