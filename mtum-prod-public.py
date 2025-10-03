@@ -5,6 +5,9 @@ Created in 2025
 @author: Quant Galore
 """
 
+import os
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -16,8 +19,26 @@ import mysql.connector
 from datetime import datetime, timedelta
 from pandas_market_calendars import get_calendar
 
-polygon_api_key = "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3"
-engine = sqlalchemy.create_engine('mysql+mysqlconnector://user:pass@localhost:3306/my_database')
+DEFAULT_POLYGON_KEY = "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3"
+polygon_api_key = os.getenv("POLYGON_API_KEY", DEFAULT_POLYGON_KEY)
+
+if polygon_api_key == DEFAULT_POLYGON_KEY:
+    print(
+        "Warning: POLYGON_API_KEY not set; using the placeholder key from the "
+        "repository. Set your own API key via the POLYGON_API_KEY environment "
+        "variable before running in production."
+    )
+
+database_url = os.getenv("MTUM_DATABASE_URL")
+engine = None
+
+if database_url:
+    engine = sqlalchemy.create_engine(database_url)
+else:
+    print(
+        "MTUM_DATABASE_URL is not set; falling back to the bundled "
+        "historical_liquid_tickers.csv file."
+    )
 
 # =============================================================================
 # Date Management
@@ -46,7 +67,23 @@ next_month_date = (pd.to_datetime(month) + timedelta(days = 30)).strftime("%Y-%m
 # Base Point-in-Time Universe + Benchmark Generation
 # =============================================================================
 
-universe = pd.read_sql("historical_liquid_tickers_polygon", con = engine)
+if engine is not None:
+    universe = pd.read_sql("historical_liquid_tickers_polygon", con=engine)
+else:
+    csv_path = Path(__file__).with_name("historical_liquid_tickers.csv")
+    if not csv_path.exists():
+        raise RuntimeError(
+            "historical_liquid_tickers.csv is not available and MTUM_DATABASE_URL "
+            "was not provided. Upload the CSV alongside this script or set a "
+            "database URL."
+        )
+
+    universe = pd.read_csv(csv_path)
+
+if "date" not in universe.columns:
+    raise RuntimeError("The universe data must include a 'date' column.")
+
+universe["date"] = pd.to_datetime(universe["date"]).dt.strftime("%Y-%m-%d")
 
 benchmark_data = pd.json_normalize(requests.get(f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2017-01-01/{trading_dates[-1]}?adjusted=true&sort=asc&limit=50000&apiKey={polygon_api_key}").json()["results"]).set_index("t")
 benchmark_data.index = pd.to_datetime(benchmark_data.index, unit="ms", utc=True).tz_convert("America/New_York")
