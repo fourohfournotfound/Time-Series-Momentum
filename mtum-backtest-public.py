@@ -36,6 +36,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forward-buffer-days", type=int, default=30, help="Forward buffer for return calculation")
     parser.add_argument("--calendar", default="NYSE", help="Market calendar to use for trading dates")
     parser.add_argument("--start-date", default="2019-01-01", help="Backtest start date for calendar generation")
+    parser.add_argument("--output-dir", default="backtest-output", help="Directory where reports and plots are written")
+    parser.add_argument(
+        "--no-show-plot",
+        dest="show_plot",
+        action="store_false",
+        help="Skip displaying the performance figure (still saved to disk)",
+    )
+    parser.set_defaults(show_plot=True)
     parser.add_argument(
         "--database-url",
         default="mysql+mysqlconnector://user:pass@localhost:3306/my_database",
@@ -133,6 +141,9 @@ def main() -> None:
     try:
         cache_dir = Path(args.cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
+
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         trading_dates = get_trading_dates(args)
         if len(trading_dates) == 0:
@@ -440,7 +451,15 @@ def main() -> None:
         plt.xlabel("Date")
         plt.ylabel("Cumulative % Returns")
         plt.tight_layout()
-        plt.show()
+
+        plot_path = output_dir / "cumulative_performance.png"
+        plt.savefig(plot_path, bbox_inches="tight")
+
+        trades_path = output_dir / "monthly_trades.csv"
+        all_trades.to_csv(trades_path, index=False)
+
+        if args.show_plot:
+            plt.show()
 
         plt.close()
     finally:

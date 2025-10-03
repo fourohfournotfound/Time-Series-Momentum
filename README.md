@@ -31,6 +31,9 @@ automatic caching so that you only download each symbol once. Key options:
 - `--cache-dir` and `--force-refresh` to manage on-disk caching of daily bars.
 - `--prefetch` with `--max-workers` to download histories in parallel when
   API limits allow.
+- `--output-dir` to control where the performance chart and monthly returns
+  report are saved. Use `--no-show-plot` when running in a headless
+  environment.
 
 The backtest pulls the full lookback window for every symbol a single time and
 reuses it across monthly iterations, dramatically reducing redundant API
