@@ -200,14 +200,54 @@ def main() -> None:
 
         all_monthly_results = []
 
+        def _format_timedelta(delta: timedelta) -> str:
+            total_seconds = int(delta.total_seconds())
+            if total_seconds <= 0:
+                return "0s"
+            days, remainder = divmod(total_seconds, 86400)
+            hours, remainder = divmod(remainder, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            parts = []
+            if days:
+                parts.append(f"{days}d")
+            if hours:
+                parts.append(f"{hours}h")
+            if minutes:
+                parts.append(f"{minutes}m")
+            if seconds or not parts:
+                parts.append(f"{seconds}s")
+            return " ".join(parts)
+
+        ticker_count = len(all_tickers)
+        completed = 0
+        durations: list[float] = []
+        loop_start_time = datetime.now()
+
         for ticker in all_tickers:
             try:
+                ticker_start_time = datetime.now()
+                print(
+                    f"[{completed + 1}/{ticker_count}] Downloading history for {ticker}...",
+                    flush=True,
+                )
                 history = load_history(ticker)
             except Exception as err:
                 print(f"{ticker} download failed: {err}")
                 continue
 
             if history.empty:
+                completed += 1
+                durations.append((datetime.now() - ticker_start_time).total_seconds())
+                if durations:
+                    average_seconds = sum(durations) / len(durations)
+                    remaining = ticker_count - completed
+                    eta = datetime.now() + timedelta(seconds=average_seconds * remaining)
+                    remaining_td = timedelta(seconds=int(average_seconds * remaining))
+                    print(
+                        f"    No data for {ticker}. Progress: {completed}/{ticker_count}. "
+                        f"ETA {eta:%Y-%m-%d %H:%M:%S} ({_format_timedelta(remaining_td)} remaining)",
+                        flush=True,
+                    )
                 continue
 
             history = history.sort_values("timestamp").drop_duplicates(subset="date", keep="last")
@@ -312,12 +352,39 @@ def main() -> None:
             )
 
             if monthly_results.empty:
+                completed += 1
+                durations.append((datetime.now() - ticker_start_time).total_seconds())
+                if durations:
+                    average_seconds = sum(durations) / len(durations)
+                    remaining = ticker_count - completed
+                    eta = datetime.now() + timedelta(seconds=average_seconds * remaining)
+                    remaining_td = timedelta(seconds=int(average_seconds * remaining))
+                    print(
+                        f"    Filtered out {ticker}. Progress: {completed}/{ticker_count}. "
+                        f"ETA {eta:%Y-%m-%d %H:%M:%S} ({_format_timedelta(remaining_td)} remaining)",
+                        flush=True,
+                    )
                 continue
 
             monthly_results["entry_date"] = pd.to_datetime(monthly_results["entry_date"]).dt.strftime("%Y-%m-%d")
             monthly_results["exit_date"] = pd.to_datetime(monthly_results["exit_date"]).dt.strftime("%Y-%m-%d")
 
             all_monthly_results.append(monthly_results)
+
+            completed += 1
+            ticker_duration = (datetime.now() - ticker_start_time).total_seconds()
+            durations.append(ticker_duration)
+            average_seconds = sum(durations) / len(durations)
+            remaining = ticker_count - completed
+            eta = datetime.now() + timedelta(seconds=average_seconds * remaining)
+            remaining_td = timedelta(seconds=int(average_seconds * remaining))
+            elapsed_td = datetime.now() - loop_start_time
+            print(
+                f"    Finished {ticker} in {ticker_duration:.2f}s. Progress: {completed}/{ticker_count}. "
+                f"Elapsed {_format_timedelta(elapsed_td)}. ETA {eta:%Y-%m-%d %H:%M:%S} "
+                f"({_format_timedelta(remaining_td)} remaining)",
+                flush=True,
+            )
 
         if not all_monthly_results:
             raise ValueError("No data collected for any month; confirm ticker universe and data availability")
