@@ -93,19 +93,79 @@ for date in monthly_dates:
         
         try:
             
-            all_contracts = pd.json_normalize(requests.get(f"https://api.polygon.io/v3/reference/options/contracts?underlying_ticker={ticker}&contract_type=call&as_of={date}&limit=1000&apiKey={polygon_api_key}").json()["results"])    
-            all_expiration_dates = np.sort(all_contracts["expiration_date"].drop_duplicates().values)
-            
-            exp_date_data = pd.DataFrame({"date": all_expiration_dates})
-            
-            if len(exp_date_data) < 5:
+            contracts_results = []
+            unique_expirations = set()
+            expiration_filter = ""
+            additional_requests = 0
+
+            while len(unique_expirations) < 5 and additional_requests < 10:
+                contracts_response = requests.get(
+                    f"https://api.polygon.io/v3/reference/options/contracts?"
+                    f"underlying_ticker={ticker}&contract_type=call&as_of={date}"
+                    f"&sort=expiration_date&order=asc&limit=6{expiration_filter}"
+                    f"&apiKey={polygon_api_key}"
+                )
+
+                if contracts_response.status_code != 200:
+                    break
+
+                page_payload = contracts_response.json()
+                page_results = page_payload.get("results", [])
+                if not page_results:
+                    break
+
+                contracts_results.extend(page_results)
+
+                expirations_seen = [
+                    result.get("expiration_date")
+                    for result in page_results
+                    if result.get("expiration_date")
+                ]
+
+                unique_expirations.update(expirations_seen)
+
+                last_expiration = expirations_seen[-1] if expirations_seen else None
+                expiration_filter = (
+                    f"&expiration_date.gt={last_expiration}" if last_expiration else ""
+                )
+
+                additional_requests += 1
+
+            if not contracts_results:
                 continue
-            
-            exp_date_data["date"] = pd.to_datetime(exp_date_data["date"]).dt.tz_localize("America/New_York")
+
+            all_contracts = pd.json_normalize(contracts_results)
+            earliest_contracts = (
+                all_contracts.sort_values("expiration_date")
+                .drop_duplicates(subset=["expiration_date"])
+                .head(5)
+            )
+
+            if earliest_contracts.shape[0] < 5:
+                continue
+
+            if "expiration_type" in earliest_contracts.columns:
+                expiration_types = (
+                    earliest_contracts["expiration_type"].dropna().str.lower().unique()
+                )
+                if "weekly" in expiration_types:
+                    weekly_ticker_data = pd.DataFrame(
+                        [{"date": date, "ticker": ticker, "avg_days_between": 7}]
+                    )
+                    weekly_ticker_data_list.append(weekly_ticker_data)
+                    continue
+
+            exp_date_data = earliest_contracts[["expiration_date"]].rename(
+                columns={"expiration_date": "date"}
+            )
+
+            exp_date_data["date"] = pd.to_datetime(exp_date_data["date"]).dt.tz_localize(
+                "America/New_York"
+            )
             exp_date_data["days_between"] = exp_date_data["date"].diff().dt.days
-    
+
             avg_days_between_exps = exp_date_data["days_between"][1:5].mean()
-            
+
             if avg_days_between_exps >= 9:
                 continue
             
