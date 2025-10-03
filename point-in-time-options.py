@@ -131,6 +131,9 @@ for date in monthly_dates:
 
                 additional_requests += 1
 
+                if len(unique_expirations) >= 5:
+                    break
+
             if not contracts_results:
                 continue
 
@@ -143,17 +146,6 @@ for date in monthly_dates:
 
             if earliest_contracts.shape[0] < 5:
                 continue
-
-            if "expiration_type" in earliest_contracts.columns:
-                expiration_types = (
-                    earliest_contracts["expiration_type"].dropna().str.lower().unique()
-                )
-                if "weekly" in expiration_types:
-                    weekly_ticker_data = pd.DataFrame(
-                        [{"date": date, "ticker": ticker, "avg_days_between": 7}]
-                    )
-                    weekly_ticker_data_list.append(weekly_ticker_data)
-                    continue
 
             exp_date_data = earliest_contracts[["expiration_date"]].rename(
                 columns={"expiration_date": "date"}
