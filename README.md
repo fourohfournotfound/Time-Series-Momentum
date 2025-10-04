@@ -31,6 +31,8 @@ automatic caching so that you only download each symbol once. Key options:
 - `--cache-dir` and `--force-refresh` to manage on-disk caching of daily bars.
 - `--prefetch` with `--max-workers` to download histories in parallel when
   API limits allow.
+- `--universe-csv` to load the point-in-time universe from a CSV file (useful in
+  notebook environments where a database connection is unavailable).
 - `--output-dir` to control where the performance chart and monthly returns
   report are saved. Use `--no-show-plot` when running in a headless
   environment.

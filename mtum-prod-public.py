@@ -157,26 +157,41 @@ next_month_date = (pd.to_datetime(month) + timedelta(days = 30)).strftime("%Y-%m
 # Base Point-in-Time Universe + Benchmark Generation
 # =============================================================================
 
-if engine is not None:
-    universe = pd.read_sql(ARGS.universe_table, con=engine)
-else:
-    csv_path = None
-    for candidate in _candidate_paths(ARGS.universe_csv):
-        if candidate.exists():
-            csv_path = candidate
-            break
-    if csv_path is None:
-        raise RuntimeError(
-            f"{ARGS.universe_csv} is not available and MTUM_DATABASE_URL was not "
-            "provided. Upload the CSV alongside this script or set a database URL."
-        )
+def _load_universe() -> pd.DataFrame:
+    if engine is not None:
+        frame = pd.read_sql(ARGS.universe_table, con=engine)
+    else:
+        csv_path = None
+        for candidate in _candidate_paths(ARGS.universe_csv):
+            if candidate.exists():
+                csv_path = candidate
+                break
+        if csv_path is None:
+            raise RuntimeError(
+                f"{ARGS.universe_csv} is not available and MTUM_DATABASE_URL was not "
+                "provided. Upload the CSV alongside this script or set a database URL."
+            )
 
-    universe = pd.read_csv(csv_path)
+        frame = pd.read_csv(csv_path)
 
-if "date" not in universe.columns:
-    raise RuntimeError("The universe data must include a 'date' column.")
+    if frame.columns.size:
+        first_col = str(frame.columns[0]).strip().lower()
+        if first_col in {"", "index", "unnamed: 0"}:
+            frame = frame.drop(columns=frame.columns[0])
 
-universe["date"] = pd.to_datetime(universe["date"]).dt.strftime("%Y-%m-%d")
+    if "date" not in frame.columns or "ticker" not in frame.columns:
+        raise RuntimeError("The universe data must include 'date' and 'ticker' columns.")
+
+    if "avg_days_between" in frame.columns:
+        avg_days = pd.to_numeric(frame["avg_days_between"], errors="coerce")
+        frame = frame.loc[avg_days < 9].copy()
+
+    frame = frame.drop_duplicates(subset=["date", "ticker"])
+    frame["date"] = pd.to_datetime(frame["date"]).dt.strftime("%Y-%m-%d")
+    return frame
+
+
+universe = _load_universe()
 
 benchmark_data = pd.json_normalize(requests.get(f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2017-01-01/{trading_dates[-1]}?adjusted=true&sort=asc&limit=50000&apiKey={polygon_api_key}").json()["results"]).set_index("t")
 benchmark_data.index = pd.to_datetime(benchmark_data.index, unit="ms", utc=True).tz_convert("America/New_York")
