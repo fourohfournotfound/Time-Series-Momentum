@@ -19,6 +19,7 @@ import mysql.connector
 from typing import List
 
 from datetime import datetime, timedelta
+from pandas.tseries.offsets import BDay
 from pandas_market_calendars import get_calendar
 
 
@@ -87,13 +88,11 @@ _load_local_env_file()
 ARGS = _parse_args()
 
 DEFAULT_POLYGON_KEY = "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3"
-polygon_api_key = ARGS.polygon_api_key or os.getenv("POLYGON_API_KEY") or DEFAULT_POLYGON_KEY
+polygon_api_key = ARGS.polygon_api_key or os.getenv("POLYGON_API_KEY")
 
-if polygon_api_key == DEFAULT_POLYGON_KEY:
-    print(
-        "Warning: POLYGON_API_KEY not set; using the placeholder key from the "
-        "repository. Set your own API key via the POLYGON_API_KEY environment "
-        "variable before running in production."
+if not polygon_api_key or polygon_api_key == DEFAULT_POLYGON_KEY:
+    raise RuntimeError(
+        "POLYGON_API_KEY not configured. Provide a valid key via --polygon-api-key or the POLYGON_API_KEY environment variable."
     )
 
 database_url = ARGS.database_url or os.getenv("MTUM_DATABASE_URL")
@@ -180,11 +179,11 @@ start_of_the_months["str_date"] = start_of_the_months["date"].dt.strftime("%Y-%m
 months = start_of_the_months["str_date"].values
 month = months[-1]
 
-start_date = (pd.to_datetime(month) - timedelta(days = 365+60)).strftime("%Y-%m-%d")
+start_date = (pd.to_datetime(month) - BDay(252 + 42)).strftime("%Y-%m-%d")
 end_date = month
 
-last_month_date = (pd.to_datetime(month) - timedelta(days = 30)).strftime("%Y-%m-%d")
-next_month_date = (pd.to_datetime(month) + timedelta(days = 30)).strftime("%Y-%m-%d")
+last_month_date = (pd.to_datetime(month) - BDay(21)).strftime("%Y-%m-%d")
+next_month_date = (pd.to_datetime(month) + BDay(21)).strftime("%Y-%m-%d")
 
 # =============================================================================
 # Base Point-in-Time Universe + Benchmark Generation
