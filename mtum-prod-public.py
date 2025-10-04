@@ -19,6 +19,33 @@ import mysql.connector
 from datetime import datetime, timedelta
 from pandas_market_calendars import get_calendar
 
+def _load_local_env_file():
+    """Populate os.environ with keys from a `.env` file if present.
+
+    This keeps the script lightweight (no python-dotenv dependency) while
+    allowing notebook users to drop a credentials file next to the script.
+    Environment variables that are already set take precedence over any
+    values declared in the file.
+    """
+
+    env_path = Path(__file__).with_name(".env")
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_local_env_file()
+
 DEFAULT_POLYGON_KEY = "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3"
 polygon_api_key = os.getenv("POLYGON_API_KEY", DEFAULT_POLYGON_KEY)
 
@@ -30,6 +57,15 @@ if polygon_api_key == DEFAULT_POLYGON_KEY:
     )
 
 database_url = os.getenv("MTUM_DATABASE_URL")
+
+if not database_url:
+    sqlite_path = Path(__file__).with_name("universe.db")
+    if sqlite_path.exists():
+        database_url = f"sqlite:///{sqlite_path}"
+        print(
+            "MTUM_DATABASE_URL not set; using the local universe.db SQLite file."
+        )
+
 engine = None
 
 if database_url:
