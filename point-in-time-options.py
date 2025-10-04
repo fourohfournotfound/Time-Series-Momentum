@@ -16,6 +16,21 @@ import mysql.connector
 from datetime import datetime, timedelta
 from pandas_market_calendars import get_calendar
 
+def _load_colab_user_secrets() -> None:
+    """Populate environment variables from Colab user secrets when available."""
+
+    try:
+        from google.colab import userdata  # type: ignore
+    except Exception:
+        return
+
+    polygon_key = userdata.get("POLYGON_API_KEY") if not os.getenv("POLYGON_API_KEY") else None
+    if polygon_key:
+        os.environ["POLYGON_API_KEY"] = polygon_key
+
+
+_load_colab_user_secrets()
+
 DEFAULT_POLYGON_KEY = "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3"
 polygon_api_key = os.getenv("POLYGON_API_KEY")
 if not polygon_api_key or polygon_api_key == DEFAULT_POLYGON_KEY:
