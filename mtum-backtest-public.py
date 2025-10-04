@@ -8,7 +8,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -46,15 +46,43 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(show_plot=True)
     parser.add_argument(
         "--database-url",
-        default="mysql+mysqlconnector://user:pass@localhost:3306/my_database",
-        help="SQLAlchemy URL for the universe database",
+        default=None,
+        help="SQLAlchemy URL for the universe database (omit to load from CSV)",
     )
     parser.add_argument(
         "--universe-table",
         default="historical_liquid_tickers_polygon",
         help="Table containing the point-in-time universe",
     )
+    parser.add_argument(
+        "--universe-csv",
+        default="historical_liquid_tickers.csv",
+        help="Fallback CSV file containing the point-in-time universe",
+    )
     return parser.parse_args()
+
+
+def candidate_paths(filename: str) -> List[Path]:
+    """Return plausible locations for a data file."""
+
+    path = Path(filename)
+    candidates: List[Path] = []
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        candidates.append(Path.cwd() / path)
+        candidates.append(Path(__file__).with_name(filename))
+
+    # Remove duplicates while preserving order
+    unique_candidates: List[Path] = []
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_candidates.append(candidate)
+    return unique_candidates
 
 
 def build_provider(args: argparse.Namespace):
@@ -71,8 +99,29 @@ def build_provider(args: argparse.Namespace):
 
 
 def load_universe(args: argparse.Namespace) -> pd.DataFrame:
-    engine = sqlalchemy.create_engine(args.database_url)
-    universe = pd.read_sql(args.universe_table, con=engine).drop_duplicates(subset=["date", "ticker"])
+    if args.database_url:
+        engine = sqlalchemy.create_engine(args.database_url)
+        universe = pd.read_sql(args.universe_table, con=engine)
+    else:
+        csv_path: Optional[Path] = None
+        for candidate in candidate_paths(args.universe_csv):
+            if candidate.exists():
+                csv_path = candidate
+                break
+        if csv_path is None:
+            raise FileNotFoundError(
+                f"Universe CSV '{args.universe_csv}' was not found in the working directory or next to the script."
+            )
+        universe = pd.read_csv(csv_path)
+        first_column = universe.columns[0]
+        first_column_name = str(first_column).strip().lower()
+        if first_column_name in {"", "index", "unnamed: 0", "unnamed:0"}:
+            universe = universe.drop(columns=first_column)
+
+    if "date" not in universe.columns or "ticker" not in universe.columns:
+        raise ValueError("Universe data must include 'date' and 'ticker' columns")
+
+    universe = universe.drop_duplicates(subset=["date", "ticker"])
     universe["date"] = pd.to_datetime(universe["date"])
     return universe.sort_values("date")
 
