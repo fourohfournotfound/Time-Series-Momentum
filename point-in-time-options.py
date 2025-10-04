@@ -5,6 +5,8 @@ Created in 2025
 @author: Quant Galore
 """
 
+import os
+
 import pandas as pd
 import numpy as np
 import requests
@@ -14,7 +16,12 @@ import mysql.connector
 from datetime import datetime, timedelta
 from pandas_market_calendars import get_calendar
 
-polygon_api_key = "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3"
+DEFAULT_POLYGON_KEY = "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3"
+polygon_api_key = os.getenv("POLYGON_API_KEY")
+if not polygon_api_key or polygon_api_key == DEFAULT_POLYGON_KEY:
+    raise RuntimeError(
+        "POLYGON_API_KEY not configured. Set the environment variable before running point-in-time options extraction."
+    )
 
 engine = sqlalchemy.create_engine('mysql+mysqlconnector://user:pass@localhost:3306/my_database')
 

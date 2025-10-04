@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import sqlalchemy
 
+from pandas.tseries.offsets import BDay
 from pandas_market_calendars import get_calendar
 
 from data_providers import AlpacaBarsClient, PolygonAggsClient
@@ -218,13 +219,27 @@ def main() -> None:
             with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
                 list(executor.map(_prefetch, all_tickers))
 
-        rebalance_gap = timedelta(days=int(args.rebalance_frequency_days))
-        feature_window = 252
+        FEATURE_WINDOW = 252
+        approx_skip_days = int(args.rebalance_frequency_days)
+        skip_trading_days = max(int(round(approx_skip_days * 252 / 365)), 1)
+        SKIP_BDAYS = skip_trading_days
+
+        def _shift_by_bdays(trading_days: np.ndarray, dates: pd.Index, n_bdays: int) -> pd.Index:
+            trading_index = pd.to_datetime(pd.Index(trading_days))
+            target_dates = pd.to_datetime(dates)
+            insertion_points = np.searchsorted(trading_index.values, target_dates.values, side="left")
+            anchor_idx = np.clip(insertion_points - n_bdays, 0, len(trading_index) - 1)
+            return pd.Index(trading_index[anchor_idx])
+
+        feature_window = FEATURE_WINDOW
 
         benchmark_data = benchmark_data.sort_values("timestamp").drop_duplicates(subset="date", keep="last")
         benchmark_data["date"] = pd.to_datetime(benchmark_data["date"])
         benchmark_data = benchmark_data.sort_values("date").reset_index(drop=True)
-        benchmark_data["benchmark_pct_change"] = benchmark_data["c"].pct_change().fillna(0) * 100
+        benchmark_pct_change = benchmark_data["c"].pct_change()
+        if not benchmark_pct_change.empty:
+            benchmark_pct_change.iloc[0] = 0.0
+        benchmark_data["benchmark_pct_change"] = benchmark_pct_change * 100
 
         universe_by_month = {
             month: set(
@@ -235,7 +250,9 @@ def main() -> None:
 
         analysis_months_index = analysis_months
         exit_months_index = months_index[1:]
-        feature_anchor_index = analysis_months - rebalance_gap
+        feature_anchor_index = _shift_by_bdays(trading_dates, analysis_months_index, SKIP_BDAYS)
+        if len(feature_anchor_index) != len(analysis_months_index):
+            raise ValueError("Feature anchor index misaligned with analysis months")
         analysis_months_array = analysis_months_index.to_numpy()
         exit_months_array = exit_months_index.to_numpy()
 
@@ -308,7 +325,10 @@ def main() -> None:
                 continue
 
             merged = merged.sort_values("date").reset_index(drop=True)
-            merged["ticker_pct_change"] = merged["c_ticker"].pct_change().fillna(0) * 100
+            ticker_pct_change = merged["c_ticker"].pct_change()
+            if not ticker_pct_change.empty:
+                ticker_pct_change.iloc[0] = 0.0
+            merged["ticker_pct_change"] = ticker_pct_change * 100
 
             rolling_cov = merged["ticker_pct_change"].rolling(window=feature_window, min_periods=feature_window).cov(
                 merged["benchmark_pct_change"]
@@ -466,20 +486,75 @@ def main() -> None:
             raise ValueError("No valid trades generated; investigate data quality or parameters")
 
         all_trades = pd.concat(trades, ignore_index=True)
-        all_trades["long_pnl"] = all_trades["long"].cumsum()
-        all_trades["short_pnl"] = all_trades["short"].cumsum()
-        all_trades["portfolio_pnl"] = all_trades["long_pnl"] + all_trades["short_pnl"]
+        if all_trades.empty:
+            raise ValueError("Trades table unexpectedly empty after concatenation")
+
+        assert {"long", "short"}.issubset(all_trades.columns)
+
+        GROSS_LONG = 1.0
+        GROSS_SHORT = 1.0
+        PER_SIDE_BPS = 2.0
+
+        def _basket_turnover_per_month(baskets: pd.DataFrame) -> pd.Series:
+            if baskets.empty:
+                return pd.Series(dtype=float)
+            grouped = baskets.groupby("entry_date")["ticker"].apply(lambda s: set(s)).sort_index()
+            turnover_values: list[float] = []
+            previous = None
+            for current in grouped.index:
+                current_set = grouped.loc[current]
+                if previous is None:
+                    turnover_values.append(1.0)
+                else:
+                    previous_set = grouped.loc[previous]
+                    union_size = max(len(current_set | previous_set), 1)
+                    overlap = len(current_set & previous_set) / union_size
+                    turnover_values.append(1.0 - overlap)
+                previous = current
+            return pd.Series(turnover_values, index=pd.to_datetime(grouped.index))
+
+        long_turnover = _basket_turnover_per_month(top_decile_dataset[["entry_date", "ticker"]])
+        short_turnover = _basket_turnover_per_month(bot_decile_dataset[["entry_date", "ticker"]])
+
+        trades_dates = pd.to_datetime(all_trades["date"])
+        turnover_frame = pd.DataFrame(index=trades_dates)
+        turnover_frame.index.name = "date"
+        turnover_frame["long_turnover"] = long_turnover.reindex(turnover_frame.index).fillna(1.0)
+        turnover_frame["short_turnover"] = short_turnover.reindex(turnover_frame.index).fillna(1.0)
+
+        long_returns = (all_trades["long"].to_numpy() / 100.0) * GROSS_LONG
+        short_returns = (all_trades["short"].to_numpy() / 100.0) * GROSS_SHORT
+        ls_returns = long_returns + short_returns
+
+        cost_decimals = (
+            (PER_SIDE_BPS / 1e4)
+            * (
+                turnover_frame["long_turnover"].to_numpy() * GROSS_LONG
+                + turnover_frame["short_turnover"].to_numpy() * GROSS_SHORT
+            )
+        )
+        ls_returns_net = ls_returns - cost_decimals
+
+        all_trades["long_nav"] = np.cumprod(1.0 + long_returns)
+        all_trades["short_nav"] = np.cumprod(1.0 + short_returns)
+        all_trades["ls_nav"] = np.cumprod(1.0 + ls_returns)
+        all_trades["ls_nav_net"] = np.cumprod(1.0 + ls_returns_net)
+        all_trades["long_cum_%"] = (all_trades["long_nav"] - 1.0) * 100.0
+        all_trades["short_cum_%"] = (all_trades["short_nav"] - 1.0) * 100.0
+        all_trades["ls_cum_%"] = (all_trades["ls_nav"] - 1.0) * 100.0
+        all_trades["ls_cum_%_net"] = (all_trades["ls_nav_net"] - 1.0) * 100.0
 
         plt.figure(figsize=(10, 6), dpi=200)
         plt.xticks(rotation=45)
-        plt.suptitle("Gross Cumulative Performance")
+        plt.suptitle("Cumulative Performance")
         plt.title("Monthly Rebalancing")
-        plt.plot(pd.to_datetime(all_trades["date"]), all_trades["long_pnl"])
-        plt.plot(pd.to_datetime(all_trades["date"]), all_trades["short_pnl"])
-        plt.plot(pd.to_datetime(all_trades["date"]), all_trades["portfolio_pnl"])
-        plt.legend(["Top Decile", "Bottom Decile", "Long-Short"])
+        plt.plot(trades_dates, all_trades["long_cum_%"], label="Top Decile (gross)")
+        plt.plot(trades_dates, all_trades["short_cum_%"], label="Bottom Decile (gross)")
+        plt.plot(trades_dates, all_trades["ls_cum_%"], label="Long-Short (gross)")
+        plt.plot(trades_dates, all_trades["ls_cum_%_net"], label="Long-Short (net est. costs)")
+        plt.legend()
         plt.xlabel("Date")
-        plt.ylabel("Cumulative % Returns")
+        plt.ylabel("Cumulative % Return")
         plt.tight_layout()
 
         plot_path = output_dir / "cumulative_performance.png"
