@@ -82,8 +82,33 @@ def _load_local_env_file():
         if key and key not in os.environ:
             os.environ[key] = value
 
+def _load_colab_user_secrets() -> None:
+    """Populate environment variables from Colab user secrets when available."""
+
+    try:
+        from google.colab import userdata  # type: ignore
+    except Exception:
+        return
+
+    secret_names = {
+        "POLYGON_API_KEY": "POLYGON_API_KEY",
+        "ALPACA_API_KEY": "ALPACA_API_KEY",
+        "ALPACA_SECRET_KEY": "ALPACA_SECRET_KEY",
+    }
+
+    for env_name, secret_name in secret_names.items():
+        if os.getenv(env_name):
+            continue
+        try:
+            value = userdata.get(secret_name)
+        except Exception:
+            continue
+        if value:
+            os.environ[env_name] = value
+
 
 _load_local_env_file()
+_load_colab_user_secrets()
 
 ARGS = _parse_args()
 
