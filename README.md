@@ -19,6 +19,9 @@ The strategy is based on a core concept in quantitative finance: securities that
   - Ranks tickers monthly into deciles.
   - Rebalances monthly based on updated scores.
   - Outputs long and short baskets ready for trading or analysis.
+  - Saves the current rebalance selections to `rebalance_outputs/rebalance_<YYYY-MM-DD>.csv`
+    (relative to the production script) so operators can review the long/short
+    baskets without rerunning the job.
 
 ## 🚀 Faster Backtests
 

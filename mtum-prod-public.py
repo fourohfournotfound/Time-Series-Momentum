@@ -364,3 +364,38 @@ full_period_ticker_data = pd.concat(monthly_ticker_list)
 top_decile = full_period_ticker_data.sort_values(by="mom_score", ascending = False).head(10)
 bot_decile = full_period_ticker_data.sort_values(by="mom_score", ascending = True).head(10)
 
+display_columns = [
+    "ticker",
+    "mom_score",
+    "beta",
+    "sharpe",
+    "12-1_return",
+    "avg_monthly_return",
+    "forward_returns",
+]
+
+print("\nTop Decile Momentum Basket (long candidates):")
+top_display_columns = [col for col in display_columns if col in top_decile.columns]
+print(top_decile[top_display_columns].to_string(index=False))
+
+print("\nBottom Decile Momentum Basket (short candidates):")
+bot_display_columns = [col for col in display_columns if col in bot_decile.columns]
+print(bot_decile[bot_display_columns].to_string(index=False))
+
+rebalance_output_dir = Path(__file__).resolve().parent / "rebalance_outputs"
+rebalance_output_dir.mkdir(exist_ok=True)
+
+rebalance_output_path = rebalance_output_dir / f"rebalance_{month}.csv"
+
+rebalance_export = pd.concat(
+    [
+        top_decile.assign(decile="top"),
+        bot_decile.assign(decile="bottom"),
+    ],
+    ignore_index=True,
+)
+
+rebalance_export.to_csv(rebalance_output_path, index=False)
+
+print(f"\nRebalance baskets saved to {rebalance_output_path}")
+
