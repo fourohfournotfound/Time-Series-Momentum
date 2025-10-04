@@ -27,6 +27,12 @@ def _parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description="Run the live momentum basket builder")
     parser.add_argument(
+        "--provider",
+        choices=["polygon"],
+        default="polygon",
+        help="Historical data provider (only polygon is supported in the prod script)",
+    )
+    parser.add_argument(
         "--polygon-api-key",
         default=None,
         help="Polygon.io API key (overrides the POLYGON_API_KEY environment variable)",
@@ -43,8 +49,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--universe-csv",
-        default="historical_liquid_tickers.csv",
-        help="Fallback CSV file containing the universe data",
+        default=None,
+        help=(
+            "CSV file containing the universe data. When provided the CSV is used in "
+            "place of the database connection."
+        ),
     )
     return parser.parse_args()
 
@@ -110,32 +119,56 @@ def _candidate_paths(filename: str) -> List[Path]:
             unique_candidates.append(candidate)
     return unique_candidates
 
-if not database_url:
-    for sqlite_path in _candidate_paths("universe.db"):
-        if sqlite_path.exists():
-            database_url = f"sqlite:///{sqlite_path}"
-            print(
-                "MTUM_DATABASE_URL not set; using the local universe.db SQLite "
-                f"file at {sqlite_path}."
-            )
-            break
-
 engine = None
 
-if database_url:
-    engine = sqlalchemy.create_engine(database_url)
+if ARGS.universe_csv:
+    csv_candidates = _candidate_paths(ARGS.universe_csv)
+    csv_path = next((path for path in csv_candidates if path.exists()), None)
+    if csv_path is None:
+        raise RuntimeError(
+            f"Universe CSV {ARGS.universe_csv} was requested but could not be found in:"
+            f" {[str(path) for path in csv_candidates]}"
+        )
+    ARGS.universe_csv = str(csv_path)
+    print(f"Using CSV universe from {csv_path}")
 else:
-    print(
-        "MTUM_DATABASE_URL is not set; falling back to the bundled "
-        f"{ARGS.universe_csv} file."
-    )
+    if not database_url:
+        for sqlite_path in _candidate_paths("universe.db"):
+            if sqlite_path.exists():
+                database_url = f"sqlite:///{sqlite_path}"
+                print(
+                    "MTUM_DATABASE_URL not set; using the local universe.db SQLite "
+                    f"file at {sqlite_path}."
+                )
+                break
+
+    if database_url:
+        engine = sqlalchemy.create_engine(database_url)
+    else:
+        default_csv = "historical_liquid_tickers.csv"
+        csv_candidates = _candidate_paths(default_csv)
+        csv_path = next((path for path in csv_candidates if path.exists()), None)
+        if csv_path is None:
+            raise RuntimeError(
+                "MTUM_DATABASE_URL is not set; the default historical_liquid_tickers.csv "
+                "file was not found either. Provide --universe-csv or a database URL."
+            )
+        ARGS.universe_csv = str(csv_path)
+        print(
+            "MTUM_DATABASE_URL is not set; falling back to the bundled "
+            f"{csv_path.name} file at {csv_path}."
+        )
+
 
 # =============================================================================
 # Date Management
 # =============================================================================
 
 calendar = get_calendar("NYSE")
-trading_dates = calendar.schedule(start_date = (datetime.today() - timedelta(days=45)), end_date = (datetime.today())).index.strftime("%Y-%m-%d").values
+trading_dates = calendar.schedule(
+    start_date=(datetime.today() - timedelta(days=45)),
+    end_date=datetime.today(),
+).index.strftime("%Y-%m-%d").values
 
 all_dates = pd.DataFrame({"date": pd.to_datetime(trading_dates)})
 all_dates["year"] = all_dates["date"].dt.year
@@ -158,21 +191,21 @@ next_month_date = (pd.to_datetime(month) + timedelta(days = 30)).strftime("%Y-%m
 # =============================================================================
 
 def _load_universe() -> pd.DataFrame:
-    if engine is not None:
-        frame = pd.read_sql(ARGS.universe_table, con=engine)
-    else:
-        csv_path = None
-        for candidate in _candidate_paths(ARGS.universe_csv):
-            if candidate.exists():
-                csv_path = candidate
-                break
+    if ARGS.universe_csv:
+        csv_candidates = _candidate_paths(ARGS.universe_csv)
+        csv_path = next((path for path in csv_candidates if path.exists()), None)
         if csv_path is None:
             raise RuntimeError(
-                f"{ARGS.universe_csv} is not available and MTUM_DATABASE_URL was not "
-                "provided. Upload the CSV alongside this script or set a database URL."
+                f"Requested universe CSV {ARGS.universe_csv} could not be located in:"
+                f" {[str(path) for path in csv_candidates]}"
             )
-
         frame = pd.read_csv(csv_path)
+    elif engine is not None:
+        frame = pd.read_sql(ARGS.universe_table, con=engine)
+    else:
+        raise RuntimeError(
+            "No universe data source configured. Provide --universe-csv or a database URL."
+        )
 
     if frame.columns.size:
         first_col = str(frame.columns[0]).strip().lower()
@@ -193,9 +226,36 @@ def _load_universe() -> pd.DataFrame:
 
 universe = _load_universe()
 
-benchmark_data = pd.json_normalize(requests.get(f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2017-01-01/{trading_dates[-1]}?adjusted=true&sort=asc&limit=50000&apiKey={polygon_api_key}").json()["results"]).set_index("t")
-benchmark_data.index = pd.to_datetime(benchmark_data.index, unit="ms", utc=True).tz_convert("America/New_York")
-benchmark_data["date"] = benchmark_data.index.strftime("%Y-%m-%d")
+
+def _fetch_polygon_aggregates(ticker: str, start: str, end: str) -> pd.DataFrame:
+    """Fetch daily aggregate bars from Polygon."""
+
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
+    params = {
+        "adjusted": "true",
+        "sort": "asc",
+        "limit": 50000,
+        "apiKey": polygon_api_key,
+    }
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    results = payload.get("results", [])
+    if not results:
+        return pd.DataFrame()
+
+    frame = pd.json_normalize(results).set_index("t")
+    frame.index = (
+        pd.to_datetime(frame.index, unit="ms", utc=True)
+        .tz_convert("America/New_York")
+    )
+    frame["date"] = frame.index.strftime("%Y-%m-%d")
+    return frame
+
+
+benchmark_data = _fetch_polygon_aggregates("SPY", "2017-01-01", trading_dates[-1])
+if benchmark_data.empty:
+    raise RuntimeError("Unable to load SPY benchmark history from Polygon")
 
 # =============================================================================
 # Real-Time Basket Construction
@@ -208,32 +268,28 @@ point_in_time_universe = universe[universe["date"] == point_in_time_date].drop_d
 
 tickers = point_in_time_universe["ticker"].drop_duplicates().values
 
-full_data_list = []
-top_decile_list = []
-bot_decile_list = []
-
 times = []
 
 monthly_ticker_list = []
     
 # ticker = tickers[np.random.randint(0, len(tickers))]
-for ticker in tickers:
+for idx, ticker in enumerate(tickers, start=1):
     
     try:
         
         start_time = datetime.now()
         
-        underlying_data = pd.json_normalize(requests.get(f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}?adjusted=true&sort=asc&limit=50000&apiKey={polygon_api_key}").json()["results"]).set_index("t")
-        underlying_data.index = pd.to_datetime(underlying_data.index, unit="ms", utc=True).tz_convert("America/New_York")
-        underlying_data["date"] = underlying_data.index.strftime("%Y-%m-%d")
-        
+        underlying_data = _fetch_polygon_aggregates(ticker, start_date, end_date)
+        if underlying_data.empty:
+            continue
+
         underlying_data["year"] = underlying_data.index.year
         underlying_data["month"] = underlying_data.index.month
         
         twelve_minus_one_data = underlying_data[underlying_data["date"] < last_month_date].copy().tail(252)
 
         if len(twelve_minus_one_data) < 252:
-                    continue
+            continue
         
         twelve_minus_one_data["year"] = twelve_minus_one_data.index.year
         twelve_minus_one_data["month"] = twelve_minus_one_data.index.month
@@ -248,22 +304,34 @@ for ticker in tickers:
         benchmark_and_underlying["benchmark_pct_change"] = round(benchmark_and_underlying["c_x"].pct_change() * 100, 2).fillna(0)
         benchmark_and_underlying["ticker_pct_change"] = round(benchmark_and_underlying["c_y"].pct_change() * 100, 2).fillna(0)
     
-        covariance_matrix = np.cov(benchmark_and_underlying["ticker_pct_change"], benchmark_and_underlying["benchmark_pct_change"])
+        covariance_matrix = np.cov(
+            benchmark_and_underlying["ticker_pct_change"],
+            benchmark_and_underlying["benchmark_pct_change"],
+        )
         covariance_ticker_benchmark = covariance_matrix[0, 1]
-        variance_benchmark = np.var(benchmark_and_underlying["benchmark_pct_change"])
+        variance_benchmark = np.var(
+            benchmark_and_underlying["benchmark_pct_change"]
+        )
+        if variance_benchmark == 0 or np.isnan(variance_benchmark):
+            continue
         beta = covariance_ticker_benchmark / variance_benchmark
         
         ticker_return_over_period = round(((benchmark_and_underlying["c_y"].iloc[-1] - benchmark_and_underlying["c_y"].iloc[0]) / benchmark_and_underlying["c_y"].iloc[0]) * 100, 2)    
-        std_of_returns = benchmark_and_underlying["ticker_pct_change"].std() * np.sqrt(252)
-        
+        std_of_returns = (
+            benchmark_and_underlying["ticker_pct_change"].std() * np.sqrt(252)
+        )
+        if std_of_returns == 0 or np.isnan(std_of_returns):
+            continue
+
         sharpe = ticker_return_over_period / std_of_returns
         
         theo_expected = beta * sharpe
         
-        forward_data = pd.json_normalize(requests.get(f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{end_date}/{next_month_date}?adjusted=true&sort=asc&limit=50000&apiKey={polygon_api_key}").json()["results"]).set_index("t")
-        forward_data.index = pd.to_datetime(forward_data.index, unit="ms", utc=True).tz_convert("America/New_York")
+        forward_data = _fetch_polygon_aggregates(ticker, end_date, next_month_date)
+        if forward_data.empty or forward_data.shape[0] < 2:
+            continue
 
-        forward_return = round(((forward_data["c"].iloc[-1] - forward_data["c"].iloc[0]) / forward_data["c"].iloc[0]) * 100, 2)    
+        forward_return = round(((forward_data["c"].iloc[-1] - forward_data["c"].iloc[0]) / forward_data["c"].iloc[0]) * 100, 2)
         
         ticker_data = pd.DataFrame([{"entry_date": month, "ticker": ticker, "beta": beta, "sharpe": sharpe, "12-1_return": ticker_return_over_period, "avg_monthly_return": avg_monthly_return, "mom_score": theo_expected, "forward_returns": forward_return}])
                 
@@ -272,20 +340,25 @@ for ticker in tickers:
         end_time = datetime.now()    
         seconds_to_complete = (end_time - start_time).total_seconds()
         times.append(seconds_to_complete)
-        iteration = round((np.where(tickers==ticker)[0][0]/len(tickers))*100,2)
-        iterations_remaining = len(tickers) - np.where(tickers==ticker)[0][0]
+        iteration = round((idx / len(tickers)) * 100, 2)
+        iterations_remaining = len(tickers) - idx
         average_time_to_complete = np.mean(times)
-        estimated_completion_time = (datetime.now() + timedelta(seconds = int(average_time_to_complete*iterations_remaining)))
+        estimated_completion_time = datetime.now() + timedelta(
+            seconds=int(average_time_to_complete * max(iterations_remaining, 0))
+        )
         time_remaining = estimated_completion_time - datetime.now()
         print(f"{iteration}% complete, {time_remaining} left, ETA: {estimated_completion_time}")
         
     except Exception as error:
-        print(error)
+        print(f"{ticker}: {error}")
         continue
     
 # =============================================================================
-# Separated Deciles    
+# Separated Deciles
 # =============================================================================
+
+if not monthly_ticker_list:
+    raise RuntimeError("No qualifying tickers were found for the current rebalance window")
 
 full_period_ticker_data = pd.concat(monthly_ticker_list)
 top_decile = full_period_ticker_data.sort_values(by="mom_score", ascending = False).head(10)
