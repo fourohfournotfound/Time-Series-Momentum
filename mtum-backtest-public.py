@@ -54,6 +54,11 @@ def parse_args() -> argparse.Namespace:
         default="historical_liquid_tickers_polygon",
         help="Table containing the point-in-time universe",
     )
+    parser.add_argument(
+        "--universe-csv",
+        default=None,
+        help="CSV file containing the point-in-time universe (overrides the database)",
+    )
     return parser.parse_args()
 
 
@@ -71,8 +76,33 @@ def build_provider(args: argparse.Namespace):
 
 
 def load_universe(args: argparse.Namespace) -> pd.DataFrame:
-    engine = sqlalchemy.create_engine(args.database_url)
-    universe = pd.read_sql(args.universe_table, con=engine).drop_duplicates(subset=["date", "ticker"])
+    if args.universe_csv:
+        csv_path = Path(args.universe_csv)
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Universe CSV {csv_path} does not exist")
+        universe = pd.read_csv(csv_path)
+    else:
+        engine = sqlalchemy.create_engine(args.database_url)
+        universe = pd.read_sql(args.universe_table, con=engine)
+
+    if not isinstance(universe, pd.DataFrame):
+        raise TypeError("Universe data must be a pandas DataFrame")
+
+    if universe.columns.size:
+        first_col = str(universe.columns[0]).strip().lower()
+        if first_col in {"", "index", "unnamed: 0"}:
+            universe = universe.drop(columns=universe.columns[0])
+
+    required_columns = {"date", "ticker"}
+    if not required_columns.issubset(universe.columns):
+        missing = ", ".join(sorted(required_columns - set(universe.columns)))
+        raise ValueError(f"Universe data is missing required columns: {missing}")
+
+    if "avg_days_between" in universe.columns:
+        avg_days = pd.to_numeric(universe["avg_days_between"], errors="coerce")
+        universe = universe.loc[avg_days < 9].copy()
+
+    universe = universe.drop_duplicates(subset=["date", "ticker"])
     universe["date"] = pd.to_datetime(universe["date"])
     return universe.sort_values("date")
 
