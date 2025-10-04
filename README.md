@@ -38,3 +38,17 @@ automatic caching so that you only download each symbol once. Key options:
 The backtest pulls the full lookback window for every symbol a single time and
 reuses it across monthly iterations, dramatically reducing redundant API
 requests.
+
+## ⚙️ Production Script Configuration
+
+`mtum-prod-public.py` now looks for credentials in the following order:
+
+1. Existing environment variables (e.g., set via `export POLYGON_API_KEY=...`).
+2. A `.env` file stored next to the script containing `KEY=value` pairs. Keys
+   already present in the environment are left untouched.
+3. For the universe database, a local `universe.db` SQLite file is used when
+   `MTUM_DATABASE_URL` is not provided. If neither is available the script
+   falls back to the bundled `historical_liquid_tickers.csv` file.
+
+This makes it easier to run the production script from notebooks or Colab
+sessions without rebuilding the environment variables each time.
