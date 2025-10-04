@@ -5,6 +5,7 @@ Created in 2025
 @author: Quant Galore
 """
 
+import argparse
 import os
 from pathlib import Path
 
@@ -15,9 +16,37 @@ import requests
 import gspread
 import sqlalchemy
 import mysql.connector
+from typing import List
 
 from datetime import datetime, timedelta
 from pandas_market_calendars import get_calendar
+
+
+def _parse_args() -> argparse.Namespace:
+    """Parse command line options for configuring data sources."""
+
+    parser = argparse.ArgumentParser(description="Run the live momentum basket builder")
+    parser.add_argument(
+        "--polygon-api-key",
+        default=None,
+        help="Polygon.io API key (overrides the POLYGON_API_KEY environment variable)",
+    )
+    parser.add_argument(
+        "--database-url",
+        default=None,
+        help="SQLAlchemy URL for the point-in-time universe database",
+    )
+    parser.add_argument(
+        "--universe-table",
+        default="historical_liquid_tickers_polygon",
+        help="Database table containing the historical liquid tickers universe",
+    )
+    parser.add_argument(
+        "--universe-csv",
+        default="historical_liquid_tickers.csv",
+        help="Fallback CSV file containing the universe data",
+    )
+    return parser.parse_args()
 
 def _load_local_env_file():
     """Populate os.environ with keys from a `.env` file if present.
@@ -46,8 +75,10 @@ def _load_local_env_file():
 
 _load_local_env_file()
 
+ARGS = _parse_args()
+
 DEFAULT_POLYGON_KEY = "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3"
-polygon_api_key = os.getenv("POLYGON_API_KEY", DEFAULT_POLYGON_KEY)
+polygon_api_key = ARGS.polygon_api_key or os.getenv("POLYGON_API_KEY") or DEFAULT_POLYGON_KEY
 
 if polygon_api_key == DEFAULT_POLYGON_KEY:
     print(
@@ -56,15 +87,38 @@ if polygon_api_key == DEFAULT_POLYGON_KEY:
         "variable before running in production."
     )
 
-database_url = os.getenv("MTUM_DATABASE_URL")
+database_url = ARGS.database_url or os.getenv("MTUM_DATABASE_URL")
+
+
+def _candidate_paths(filename: str) -> List[Path]:
+    """Return plausible locations for a data file."""
+
+    path = Path(filename)
+    candidates = []
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        candidates.append(Path.cwd() / path)
+        candidates.append(Path(__file__).with_name(filename))
+    # Remove duplicates while preserving order
+    unique_candidates = []
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_candidates.append(candidate)
+    return unique_candidates
 
 if not database_url:
-    sqlite_path = Path(__file__).with_name("universe.db")
-    if sqlite_path.exists():
-        database_url = f"sqlite:///{sqlite_path}"
-        print(
-            "MTUM_DATABASE_URL not set; using the local universe.db SQLite file."
-        )
+    for sqlite_path in _candidate_paths("universe.db"):
+        if sqlite_path.exists():
+            database_url = f"sqlite:///{sqlite_path}"
+            print(
+                "MTUM_DATABASE_URL not set; using the local universe.db SQLite "
+                f"file at {sqlite_path}."
+            )
+            break
 
 engine = None
 
@@ -73,7 +127,7 @@ if database_url:
 else:
     print(
         "MTUM_DATABASE_URL is not set; falling back to the bundled "
-        "historical_liquid_tickers.csv file."
+        f"{ARGS.universe_csv} file."
     )
 
 # =============================================================================
@@ -104,14 +158,17 @@ next_month_date = (pd.to_datetime(month) + timedelta(days = 30)).strftime("%Y-%m
 # =============================================================================
 
 if engine is not None:
-    universe = pd.read_sql("historical_liquid_tickers_polygon", con=engine)
+    universe = pd.read_sql(ARGS.universe_table, con=engine)
 else:
-    csv_path = Path(__file__).with_name("historical_liquid_tickers.csv")
-    if not csv_path.exists():
+    csv_path = None
+    for candidate in _candidate_paths(ARGS.universe_csv):
+        if candidate.exists():
+            csv_path = candidate
+            break
+    if csv_path is None:
         raise RuntimeError(
-            "historical_liquid_tickers.csv is not available and MTUM_DATABASE_URL "
-            "was not provided. Upload the CSV alongside this script or set a "
-            "database URL."
+            f"{ARGS.universe_csv} is not available and MTUM_DATABASE_URL was not "
+            "provided. Upload the CSV alongside this script or set a database URL."
         )
 
     universe = pd.read_csv(csv_path)
