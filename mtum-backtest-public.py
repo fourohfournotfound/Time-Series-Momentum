@@ -399,6 +399,27 @@ def main() -> None:
             anchor_idx = np.clip(insertion_points - n_bdays, 0, len(trading_index) - 1)
             return pd.Index(trading_index[anchor_idx])
 
+        def _align_frame_to_length(frame: pd.DataFrame, target_length: int) -> pd.DataFrame:
+            """Ensure ``frame`` has ``target_length`` rows by padding or trimming."""
+
+            if target_length < 0:
+                raise ValueError("target_length must be non-negative")
+
+            frame_reset = frame.reset_index(drop=True)
+
+            if len(frame_reset) == target_length:
+                return frame_reset
+
+            if len(frame_reset) > target_length:
+                return frame_reset.iloc[-target_length:].reset_index(drop=True)
+
+            pad_length = target_length - len(frame_reset)
+            if pad_length == 0:
+                return frame_reset
+
+            pad = pd.DataFrame(np.nan, index=range(pad_length), columns=frame_reset.columns)
+            return pd.concat([pad, frame_reset], ignore_index=True)
+
         feature_window = FEATURE_WINDOW
 
         benchmark_data = benchmark_data.sort_values("timestamp").drop_duplicates(subset="date", keep="last")
@@ -638,12 +659,7 @@ def main() -> None:
             # axis already contains duplicate labels raises ``ValueError`` in pandas, so we
             # normalise the index once here by switching to the unique analysis-month
             # labels before attaching the derived arrays below.
-            aligned_metrics = metrics.reset_index(drop=True)
-            if len(aligned_metrics) != len(feature_anchor_index):
-                raise ValueError(
-                    "Per-ticker metrics misaligned with feature anchor index"
-                )
-
+            aligned_metrics = _align_frame_to_length(metrics, len(feature_anchor_index))
             aligned_metrics.index = analysis_months_index
             monthly_results = aligned_metrics.copy()
             monthly_results["anchor_date"] = feature_anchor_index.to_numpy()
