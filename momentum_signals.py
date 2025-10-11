@@ -65,9 +65,8 @@ def make_log_returns_from_prices(prices: pd.DataFrame, price_col: str = "close")
         raise KeyError(f"Column '{price_col}' not present in prices DataFrame")
     px = prices[[price_col]].sort_index()
     grouped = px.groupby(level="ticker")[price_col]
-    log_ret = grouped.apply(lambda s: np.log(s) - np.log(s.shift(1)))
+    log_ret = grouped.transform(lambda s: np.log(s).diff())
     log_ret.name = "ret"
-    log_ret = log_ret.reindex(px.index)
     return log_ret
 
 
