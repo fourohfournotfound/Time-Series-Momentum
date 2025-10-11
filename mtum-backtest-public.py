@@ -630,20 +630,25 @@ def main() -> None:
                 forward_returns[valid_mask] = result_returns
                 holding_period_days[valid_mask] = (valid_exit_idx - valid_entry_idx).astype(float)
 
-            monthly_results = pd.DataFrame(
-                {
-                    "entry_date": analysis_months_array,
-                    "exit_date": exit_months_array,
-                    "ticker": ticker,
-                    "beta": metrics["beta"].to_numpy(),
-                    "sharpe": metrics["sharpe"].to_numpy(),
-                    "12-1_return": metrics["12-1_return"].to_numpy(),
-                    "mom_score": metrics["mom_score"].to_numpy(),
-                    "forward_returns": forward_returns,
-                    "holding_period_days": holding_period_days,
-                    "volatility_ann": metrics.get("volatility_ann", pd.Series(index=metrics.index, dtype=float)).to_numpy(),
-                }
+            # Ensure we maintain a consistent number of rows for every component that will
+            # be concatenated.  The metrics frame is already indexed by
+            # ``feature_anchor_index`` (one row per analysis month) but we clone it here so
+            # that we can safely append the additional arrays that were computed outside of
+            # the frame without triggering the "All arrays must be of the same length"
+            # constructor error.
+            aligned_metrics = metrics.reindex(feature_anchor_index)
+            monthly_results = aligned_metrics.copy()
+
+            monthly_results["entry_date"] = pd.Series(analysis_months_array, index=monthly_results.index)
+            monthly_results["exit_date"] = pd.Series(exit_months_array, index=monthly_results.index)
+            monthly_results["ticker"] = ticker
+            monthly_results["forward_returns"] = pd.Series(forward_returns, index=monthly_results.index)
+            monthly_results["holding_period_days"] = pd.Series(
+                holding_period_days, index=monthly_results.index
             )
+
+            if "volatility_ann" not in monthly_results.columns:
+                monthly_results["volatility_ann"] = np.nan
 
             signal_columns = [
                 col
@@ -654,8 +659,8 @@ def main() -> None:
                 or col.startswith("return_")
             ]
             for column in signal_columns:
-                if column in metrics.columns:
-                    monthly_results[column] = metrics[column].to_numpy()
+                if column in aligned_metrics.columns:
+                    monthly_results[column] = aligned_metrics[column].to_numpy()
 
             entry_vol_daily = monthly_results["volatility_ann"].to_numpy() / np.sqrt(ANNUALIZATION)
             horizon = np.maximum(monthly_results["holding_period_days"].to_numpy(), 1.0)
