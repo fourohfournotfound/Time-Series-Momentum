@@ -631,13 +631,22 @@ def main() -> None:
                 holding_period_days[valid_mask] = (valid_exit_idx - valid_entry_idx).astype(float)
 
             # Ensure we maintain a consistent number of rows for every component that will
-            # be concatenated.  The metrics frame is already indexed by
-            # ``feature_anchor_index`` (one row per analysis month) but we clone it here so
-            # that we can safely append the additional arrays that were computed outside of
-            # the frame without triggering the "All arrays must be of the same length"
-            # constructor error.
-            aligned_metrics = metrics.reindex(feature_anchor_index)
+            # be concatenated.  The metrics frame is already aligned with
+            # ``feature_anchor_index`` (one row per analysis month); however, the anchor
+            # dates can repeat when multiple analysis months share the same lookback
+            # trading session (e.g. holidays or week-ends).  Reindexing a DataFrame whose
+            # axis already contains duplicate labels raises ``ValueError`` in pandas, so we
+            # normalise the index once here by switching to the unique analysis-month
+            # labels before attaching the derived arrays below.
+            aligned_metrics = metrics.reset_index(drop=True)
+            if len(aligned_metrics) != len(feature_anchor_index):
+                raise ValueError(
+                    "Per-ticker metrics misaligned with feature anchor index"
+                )
+
+            aligned_metrics.index = analysis_months_index
             monthly_results = aligned_metrics.copy()
+            monthly_results["anchor_date"] = feature_anchor_index.to_numpy()
 
             monthly_results["entry_date"] = pd.Series(analysis_months_array, index=monthly_results.index)
             monthly_results["exit_date"] = pd.Series(exit_months_array, index=monthly_results.index)
