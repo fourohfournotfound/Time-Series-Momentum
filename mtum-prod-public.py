@@ -22,6 +22,21 @@ from datetime import datetime, timedelta
 from pandas.tseries.offsets import BDay
 from pandas_market_calendars import get_calendar
 
+from momentum_signals import (
+    ema_crossover_price,
+    ewm_momentum_returns,
+    ewm_volatility,
+    make_log_returns_from_prices,
+    parse_halflife_string,
+    rolling_volatility,
+    sharpe_like_trend,
+    trailing_return,
+    yang_zhang_vol,
+)
+
+
+ANNUALIZATION = 252
+FEATURE_WINDOW = 252
 
 def _parse_args() -> argparse.Namespace:
     """Parse command line options for configuring data sources."""
@@ -55,6 +70,47 @@ def _parse_args() -> argparse.Namespace:
             "CSV file containing the universe data. When provided the CSV is used in "
             "place of the database connection."
         ),
+    )
+    parser.add_argument(
+        "--momentum-style",
+        choices=["classic", "ewma", "ewma_sr", "ema_crossover", "composite"],
+        default="classic",
+        help="Momentum signal to use for live ranking",
+    )
+    parser.add_argument(
+        "--ewm-half-lives",
+        default="63,126,252",
+        help="Comma separated half-lives (trading days) for EWMA momentum components",
+    )
+    parser.add_argument(
+        "--ema-fast-halflife",
+        type=int,
+        default=32,
+        help="Half-life for the fast EMA in the crossover",
+    )
+    parser.add_argument(
+        "--ema-slow-halflife",
+        type=int,
+        default=128,
+        help="Half-life for the slow EMA in the crossover",
+    )
+    parser.add_argument(
+        "--vol-estimator",
+        choices=["rolling", "ewm", "yang-zhang"],
+        default="ewm",
+        help="Volatility estimator used for risk scaling",
+    )
+    parser.add_argument(
+        "--vol-window",
+        type=int,
+        default=20,
+        help="Window for rolling/Yang-Zhang volatility estimators",
+    )
+    parser.add_argument(
+        "--vol-ewm-halflife",
+        type=int,
+        default=20,
+        help="Half-life for the EWMA volatility estimator",
     )
     return parser.parse_args()
 
@@ -110,7 +166,61 @@ def _load_colab_user_secrets() -> None:
 _load_local_env_file()
 _load_colab_user_secrets()
 
+
+def _compute_volatility_series(returns: pd.Series, prices: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.Series, str]:
+    if args.vol_estimator == "rolling":
+        vol = rolling_volatility(returns, window=args.vol_window)
+        return vol, "vol_rolling_ann"
+    if args.vol_estimator == "ewm":
+        vol = ewm_volatility(returns, hl=args.vol_ewm_halflife)
+        return vol, "vol_ewm_ann"
+    vol = yang_zhang_vol(prices, window=args.vol_window)
+    return vol, "vol_yz_ann"
+
+
+def _compute_momentum_score(metrics: pd.DataFrame, style: str) -> pd.Series:
+    if style == "classic":
+        if {"beta", "sharpe"}.issubset(metrics.columns):
+            return metrics["beta"] * metrics["sharpe"]
+        return metrics.get("mom_score", pd.Series(index=metrics.index, dtype=float))
+
+    if style == "ewma":
+        ewma_cols = [col for col in metrics.columns if col.startswith("mom_ewm_hl") and not col.endswith("_sr")]
+        if ewma_cols:
+            return metrics[ewma_cols].mean(axis=1)
+
+    if style == "ewma_sr":
+        sr_cols = [col for col in metrics.columns if col.endswith("_sr")]
+        if sr_cols:
+            return metrics[sr_cols].mean(axis=1)
+
+    if style == "ema_crossover":
+        if "ema_xover_norm" in metrics.columns:
+            return metrics["ema_xover_norm"]
+
+    if style == "composite":
+        components = []
+        sr_cols = [col for col in metrics.columns if col.endswith("_sr")]
+        if sr_cols:
+            components.append(metrics[sr_cols].mean(axis=1))
+        if "ema_xover_norm" in metrics.columns:
+            components.append(metrics["ema_xover_norm"])
+        ewma_cols = [col for col in metrics.columns if col.startswith("mom_ewm_hl") and not col.endswith("_sr")]
+        if ewma_cols:
+            components.append(metrics[ewma_cols].mean(axis=1))
+        if components:
+            stacked = pd.concat(components, axis=1)
+            return stacked.mean(axis=1)
+
+    return pd.Series(index=metrics.index, dtype=float)
+
+
 ARGS = _parse_args()
+
+try:
+    EWM_HALF_LIVES = parse_halflife_string(ARGS.ewm_half_lives)
+except ValueError as exc:
+    raise RuntimeError(f"Invalid --ewm-half-lives '{ARGS.ewm_half_lives}': {exc}") from exc
 
 DEFAULT_POLYGON_KEY = "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3"
 polygon_api_key = ARGS.polygon_api_key or os.getenv("POLYGON_API_KEY")
@@ -348,17 +458,146 @@ for idx, ticker in enumerate(tickers, start=1):
             continue
 
         sharpe = ticker_return_over_period / std_of_returns
-        
-        theo_expected = beta * sharpe
-        
+
+        price_frame = underlying_data.copy()
+        price_frame.index = pd.to_datetime(price_frame["date"])
+        price_frame = price_frame.sort_index()
+        price_frame = price_frame.loc[~price_frame.index.duplicated(keep="last")]
+        if "c" not in price_frame.columns:
+            continue
+
+        price_components = {"close": price_frame["c"]}
+        if "o" in price_frame.columns:
+            price_components["open"] = price_frame["o"]
+        if "h" in price_frame.columns:
+            price_components["high"] = price_frame["h"]
+        if "l" in price_frame.columns:
+            price_components["low"] = price_frame["l"]
+
+        ohlc_frame = pd.DataFrame(price_components)
+        ohlc_frame.index.name = "date"
+        ohlc_frame["ticker"] = ticker
+        multi_price = (
+            ohlc_frame.set_index("ticker", append=True)
+            .reorder_levels(["ticker", "date"])
+            .sort_index()
+        )
+        multi_price.index.set_names(["ticker", "date"], inplace=True)
+
+        returns_series = make_log_returns_from_prices(multi_price, price_col="close")
+
+        try:
+            vol_series, vol_column = _compute_volatility_series(returns_series, multi_price, ARGS)
+        except KeyError as err:
+            if ARGS.vol_estimator == "yang-zhang":
+                print(f"{ticker}: {err}. Falling back to EWMA volatility.")
+                vol_series = ewm_volatility(returns_series, hl=ARGS.vol_ewm_halflife)
+                vol_column = "vol_ewm_ann"
+            else:
+                raise
+
+        anchor_date = pd.to_datetime(twelve_minus_one_data["date"].iloc[-1])
+        feature_index = pd.DatetimeIndex([anchor_date])
+
+        metrics = pd.DataFrame(
+            {
+                "beta": [beta],
+                "sharpe": [sharpe],
+                "12-1_return": [ticker_return_over_period],
+            },
+            index=feature_index,
+        )
+
+        feature_block = pd.DataFrame(index=feature_index, dtype=float)
+        vol_single = vol_series.xs(ticker, level="ticker")
+        feature_block[vol_column] = vol_single.reindex(feature_index, method="ffill")
+        feature_block["volatility_ann"] = feature_block[vol_column]
+
+        trailing_series = trailing_return(multi_price, window=FEATURE_WINDOW, price_col="close")
+        trailing_single = trailing_series.xs(ticker, level="ticker") * 100.0
+        feature_block[f"return_{FEATURE_WINDOW}d"] = trailing_single.reindex(feature_index, method="ffill")
+
+        mom_ewm_df = None
+        if ARGS.momentum_style in {"ewma", "ewma_sr", "composite"}:
+            mom_ewm_df = ewm_momentum_returns(returns_series, half_lives=EWM_HALF_LIVES)
+            mom_ewm_single = mom_ewm_df.xs(ticker, level="ticker")
+            for column in mom_ewm_single.columns:
+                feature_block[column] = mom_ewm_single[column].reindex(feature_index, method="ffill")
+
+        if ARGS.momentum_style in {"ewma_sr", "composite"} and mom_ewm_df is not None:
+            sr_df = sharpe_like_trend(mom_ewm_df, vol_series, annualize=ANNUALIZATION)
+            sr_single = sr_df.xs(ticker, level="ticker")
+            for column in sr_single.columns:
+                feature_block[column] = sr_single[column].reindex(feature_index, method="ffill")
+
+        if ARGS.momentum_style in {"ema_crossover", "composite"}:
+            ema_series = ema_crossover_price(
+                multi_price,
+                fast_hl=ARGS.ema_fast_halflife,
+                slow_hl=ARGS.ema_slow_halflife,
+                price_col="close",
+            )
+            ema_single = ema_series.xs(ticker, level="ticker")
+            feature_block["ema_xover_norm"] = ema_single.reindex(feature_index, method="ffill")
+
+        metrics = metrics.join(feature_block, how="left")
+        metrics = metrics.replace([np.inf, -np.inf], np.nan)
+        metrics["mom_score"] = _compute_momentum_score(metrics, ARGS.momentum_style)
+
+        if metrics["mom_score"].isna().all() or metrics["volatility_ann"].isna().all():
+            continue
+
         forward_data = _fetch_polygon_aggregates(ticker, end_date, next_month_date)
         if forward_data.empty or forward_data.shape[0] < 2:
             continue
 
         forward_return = round(((forward_data["c"].iloc[-1] - forward_data["c"].iloc[0]) / forward_data["c"].iloc[0]) * 100, 2)
-        
-        ticker_data = pd.DataFrame([{"entry_date": month, "ticker": ticker, "beta": beta, "sharpe": sharpe, "12-1_return": ticker_return_over_period, "avg_monthly_return": avg_monthly_return, "mom_score": theo_expected, "forward_returns": forward_return}])
-                
+        forward_days = max(forward_data.shape[0] - 1, 1)
+
+        vol_value = metrics["volatility_ann"].iloc[0]
+        entry_vol_daily = vol_value / np.sqrt(ANNUALIZATION) if pd.notna(vol_value) else np.nan
+        if pd.isna(metrics["mom_score"].iloc[0]) or pd.isna(vol_value):
+            continue
+
+        forward_return_sr = np.nan
+        if entry_vol_daily and entry_vol_daily > 0:
+            forward_return_sr = (forward_return / 100.0) / (entry_vol_daily * np.sqrt(forward_days))
+
+        record = {
+            "entry_date": month,
+            "anchor_date": anchor_date.strftime("%Y-%m-%d"),
+            "ticker": ticker,
+            "beta": float(metrics["beta"].iloc[0]),
+            "sharpe": float(metrics["sharpe"].iloc[0]),
+            "12-1_return": float(metrics["12-1_return"].iloc[0]),
+            "avg_monthly_return": avg_monthly_return,
+            "mom_score": float(metrics["mom_score"].iloc[0]),
+            "forward_returns": forward_return,
+            "forward_return_sr": forward_return_sr,
+            "volatility_ann": vol_value,
+            "vol_column": vol_column,
+            "momentum_style": ARGS.momentum_style,
+            "vol_estimator": ARGS.vol_estimator,
+            "ewm_half_lives": ",".join(str(v) for v in EWM_HALF_LIVES),
+            "ema_fast_halflife": ARGS.ema_fast_halflife,
+            "ema_slow_halflife": ARGS.ema_slow_halflife,
+            "holding_period_days": forward_days,
+        }
+
+        signal_columns = [
+            col
+            for col in metrics.columns
+            if col.startswith("mom_ewm_hl")
+            or col.endswith("_sr")
+            or col == "ema_xover_norm"
+            or col.startswith("return_")
+        ]
+        for column in signal_columns:
+            value = metrics[column].iloc[0]
+            record[column] = float(value) if pd.notna(value) else np.nan
+
+        ticker_data = pd.DataFrame([record])
+
         monthly_ticker_list.append(ticker_data)
         
         end_time = datetime.now()    
@@ -396,6 +635,12 @@ display_columns = [
     "12-1_return",
     "avg_monthly_return",
     "forward_returns",
+    "forward_return_sr",
+    "volatility_ann",
+    "momentum_style",
+    "vol_estimator",
+    "vol_column",
+    "anchor_date",
 ]
 
 print("\nTop Decile Momentum Basket (long candidates):")
