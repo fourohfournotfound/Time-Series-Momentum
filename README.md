@@ -40,6 +40,51 @@ automatic caching so that you only download each symbol once. Key options:
   report are saved. Use `--no-show-plot` when running in a headless
   environment.
 
+### Momentum / volatility configuration
+
+Both the backtest (`mtum-backtest-public.py`) and the production rebalance
+script (`mtum-prod-public.py`) expose the same knobs for selecting the momentum
+signal and risk model. The most common combinations are:
+
+```bash
+# Classic 12-1 momentum with the legacy beta × sharpe score
+python mtum-backtest-public.py --momentum-style classic
+
+# EWMA momentum (trend-signature style) with three half-life components
+python mtum-backtest-public.py --momentum-style ewma --ewm-half-lives 63,126,252
+
+# Sharpe-like (vol-scaled) EWMA features for smoother rankings
+python mtum-backtest-public.py --momentum-style ewma_sr --ewm-half-lives 42,84,168
+
+# EMA crossover trend filter
+python mtum-backtest-public.py --momentum-style ema_crossover \
+    --ema-fast-halflife 32 --ema-slow-halflife 128
+
+# Blend EWMA Sharpe and EMA crossover (default weights are equal)
+python mtum-backtest-public.py --momentum-style composite
+
+# Switch between volatility estimators
+python mtum-backtest-public.py --vol-estimator ewm --vol-ewm-halflife 20
+python mtum-backtest-public.py --vol-estimator rolling --vol-window 40
+python mtum-backtest-public.py --vol-estimator yang-zhang --vol-window 40
+
+# Apply the Moreira–Muir style overlay in the performance report
+python mtum-backtest-public.py --momentum-style composite \
+    --apply-vol-overlay --overlay-target-vol 0.12 --overlay-halflife 63
+```
+
+Any option shown above can be supplied to the production script in exactly the
+same way when you want the live rebalance output to use the new signal:
+
+```bash
+python mtum-prod-public.py --momentum-style ewma_sr --ewm-half-lives 42,84,168 \
+    --vol-estimator yang-zhang --vol-window 40
+```
+
+When the scripts run they print the resolved configuration (momentum style,
+volatility estimator, and overlay choice) so you can confirm the live job is
+using the intended settings.
+
 The backtest pulls the full lookback window for every symbol a single time and
 reuses it across monthly iterations, dramatically reducing redundant API
 requests.
