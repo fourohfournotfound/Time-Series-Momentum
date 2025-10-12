@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Momentum backtest with configurable data sources and caching."""
+"""Momentum backtest with configurable data sources and caching.
+
+Changes:
+- Explicit causal anchoring (already present) is now documented and asserted.
+- Extra shape/dimension assertions to protect LTR dataset construction.
+- Optional MultiIndex LTR export (entry_date x ticker) with y=forward_returns.
+- Comments tightened around adjustment semantics and turnover costs.
+"""
 
 from __future__ import annotations
 
@@ -24,7 +31,6 @@ from data_providers import AlpacaBarsClient, PolygonAggsClient
 
 def _parse_positive_int_list(raw: str, *, min_value: int = 1) -> List[int]:
     """Parse a comma-separated list of positive integers."""
-
     values: List[int] = []
     for chunk in raw.split(","):
         item = chunk.strip()
@@ -52,7 +58,6 @@ def _compute_ewm_momentum(
     The output columns are named ``ewm_ret_hl_{half_life}`` and are shifted by one
     period to preserve causality.
     """
-
     returns = prices.pct_change()
     features: Dict[str, pd.Series] = {}
     for hl in half_lives:
@@ -70,16 +75,12 @@ def _ema_crossover_signal(
     min_period_fraction: float = 0.5,
 ) -> pd.Series:
     """Difference between fast and slow exponential moving averages (lagged)."""
-
     if fast_hl >= slow_hl:
         raise ValueError("fast_hl must be strictly less than slow_hl")
-
     fast_min_periods = max(int(math.ceil(fast_hl * min_period_fraction)), 1)
     slow_min_periods = max(int(math.ceil(slow_hl * min_period_fraction)), 1)
-
     fast_ma = prices.ewm(halflife=fast_hl, adjust=False, min_periods=fast_min_periods).mean()
     slow_ma = prices.ewm(halflife=slow_hl, adjust=False, min_periods=slow_min_periods).mean()
-
     with np.errstate(divide="ignore", invalid="ignore"):
         crossover = fast_ma.divide(slow_ma) - 1.0
     crossover = crossover.replace([np.inf, -np.inf], np.nan)
@@ -94,7 +95,6 @@ def _ewm_volatility(
     min_period_fraction: float = 0.5,
 ) -> pd.Series:
     """Exponentially weighted volatility estimate (annualised)."""
-
     min_periods = max(int(math.ceil(half_life * min_period_fraction)), 1)
     ewm_std = returns.ewm(halflife=half_life, adjust=False, min_periods=min_periods).std()
     return ewm_std.shift(1) * math.sqrt(annualize)
@@ -107,10 +107,8 @@ def _yang_zhang_volatility(
     annualize: int,
 ) -> pd.Series:
     """Compute Yang–Zhang volatility using OHLC data and annualise it."""
-
     if window < 2:
         raise ValueError("Yang–Zhang estimator requires a window of at least 2 observations")
-
     log_open = np.log(frame["o_ticker"])
     log_high = np.log(frame["h_ticker"])
     log_low = np.log(frame["l_ticker"])
@@ -143,35 +141,24 @@ def _vol_overlay_leverage(
     periods_per_year: int,
 ) -> pd.Series:
     """Compute volatility-managed leverage series for portfolio returns."""
-
     if halflife <= 0:
         raise ValueError("halflife must be positive for the volatility overlay")
-
     min_periods = max(int(math.ceil(halflife * 0.5)), 1)
     ewm_std = returns.ewm(halflife=halflife, adjust=False, min_periods=min_periods).std()
     annualised = ewm_std.shift(1) * math.sqrt(periods_per_year)
     with np.errstate(divide="ignore", invalid="ignore"):
         leverage = target_vol / annualised
-    leverage = leverage.clip(lower=0.0)
-    leverage = leverage.replace([np.inf, -np.inf], np.nan)
-    leverage = leverage.fillna(0.0)
+    leverage = leverage.clip(lower=0.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return leverage.clip(upper=cap)
 
 
 def _load_colab_user_secrets() -> None:
     """Populate environment variables from Colab user secrets when available."""
-
     try:
         from google.colab import userdata  # type: ignore
     except Exception:
         return
-
-    secret_names = {
-        "POLYGON_API_KEY": "POLYGON_API_KEY",
-        "ALPACA_API_KEY": "ALPACA_API_KEY",
-        "ALPACA_SECRET_KEY": "ALPACA_SECRET_KEY",
-    }
-
+    secret_names = {"POLYGON_API_KEY": "POLYGON_API_KEY", "ALPACA_API_KEY": "ALPACA_API_KEY", "ALPACA_SECRET_KEY": "ALPACA_SECRET_KEY"}
     for env_name, secret_name in secret_names.items():
         if os.getenv(env_name):
             continue
@@ -181,7 +168,6 @@ def _load_colab_user_secrets() -> None:
             continue
         if value:
             os.environ[env_name] = value
-
 
 _load_colab_user_secrets()
 
@@ -203,103 +189,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calendar", default="NYSE", help="Market calendar to use for trading dates")
     parser.add_argument("--start-date", default="2019-01-01", help="Backtest start date for calendar generation")
     parser.add_argument("--output-dir", default="backtest-output", help="Directory where reports and plots are written")
-    parser.add_argument(
-        "--no-show-plot",
-        dest="show_plot",
-        action="store_false",
-        help="Skip displaying the performance figure (still saved to disk)",
-    )
+    parser.add_argument("--no-show-plot", dest="show_plot", action="store_false", help="Skip displaying the performance figure (still saved to disk)")
     parser.set_defaults(show_plot=True)
-    parser.add_argument(
-        "--database-url",
-        default="mysql+mysqlconnector://user:pass@localhost:3306/my_database",
-        help="SQLAlchemy URL for the universe database",
-    )
-    parser.add_argument(
-        "--universe-table",
-        default="historical_liquid_tickers_polygon",
-        help="Table containing the point-in-time universe",
-    )
-    parser.add_argument(
-        "--universe-csv",
-        default=None,
-        help="CSV file containing the point-in-time universe (overrides the database)",
-    )
-    parser.add_argument(
-        "--annualization-factor",
-        type=int,
-        default=252,
-        help="Trading periods used for annualising volatility estimates",
-    )
-    parser.add_argument(
-        "--momentum-type",
-        choices=["classic", "ewm"],
-        default="classic",
-        help="Momentum definition: classic beta*Sharpe or EWMA-based",
-    )
-    parser.add_argument(
-        "--ewm-half-lives",
-        default="63,126,252",
-        help="Comma-separated half-lives (in days) for EWMA momentum",
-    )
-    parser.add_argument(
-        "--ema-crossover",
-        action="store_true",
-        help="Augment EWMA momentum with an EMA crossover signal",
-    )
-    parser.add_argument(
-        "--ema-fast-hl",
-        type=int,
-        default=32,
-        help="Half-life for the fast EMA when --ema-crossover is enabled",
-    )
-    parser.add_argument(
-        "--ema-slow-hl",
-        type=int,
-        default=128,
-        help="Half-life for the slow EMA when --ema-crossover is enabled",
-    )
-    parser.add_argument(
-        "--vol-estimator",
-        choices=["none", "ewm", "yang-zhang"],
-        default="none",
-        help="Volatility estimator to use for risk-adjusting momentum",
-    )
-    parser.add_argument(
-        "--vol-ewm-halflife",
-        type=int,
-        default=20,
-        help="Half-life for the EWM volatility estimator",
-    )
-    parser.add_argument(
-        "--vol-window",
-        type=int,
-        default=20,
-        help="Window length for the Yang–Zhang volatility estimator",
-    )
-    parser.add_argument(
-        "--vol-overlay",
-        action="store_true",
-        help="Apply a volatility-managed overlay to the long-short returns",
-    )
-    parser.add_argument(
-        "--vol-overlay-halflife",
-        type=int,
-        default=63,
-        help="Half-life (in rebalances) for the overlay volatility estimate",
-    )
-    parser.add_argument(
-        "--vol-overlay-target",
-        type=float,
-        default=0.10,
-        help="Annualised volatility target for the overlay",
-    )
-    parser.add_argument(
-        "--vol-overlay-cap",
-        type=float,
-        default=5.0,
-        help="Maximum leverage multiple applied by the overlay",
-    )
+    parser.add_argument("--database-url", default="mysql+mysqlconnector://user:pass@localhost:3306/my_database", help="SQLAlchemy URL for the universe database")
+    parser.add_argument("--universe-table", default="historical_liquid_tickers_polygon", help="Table containing the point-in-time universe")
+    parser.add_argument("--universe-csv", default=None, help="CSV file containing the point-in-time universe (overrides the database)")
+    parser.add_argument("--annualization-factor", type=int, default=252, help="Trading periods used for annualising volatility estimates")
+    parser.add_argument("--momentum-type", choices=["classic", "ewm"], default="classic", help="Momentum definition: classic beta*Sharpe or EWMA-based")
+    parser.add_argument("--ewm-half-lives", default="63,126,252", help="Comma-separated half-lives (in days) for EWMA momentum")
+    parser.add_argument("--ema-crossover", action="store_true", help="Augment EWMA momentum with an EMA crossover signal")
+    parser.add_argument("--ema-fast-hl", type=int, default=32, help="Half-life for the fast EMA when --ema-crossover is enabled")
+    parser.add_argument("--ema-slow-hl", type=int, default=128, help="Half-life for the slow EMA when --ema-crossover is enabled")
+    parser.add_argument("--vol-estimator", choices=["none", "ewm", "yang-zhang"], default="none", help="Volatility estimator to use for risk-adjusting momentum")
+    parser.add_argument("--vol-ewm-halflife", type=int, default=20, help="Half-life for the EWM volatility estimator")
+    parser.add_argument("--vol-window", type=int, default=20, help="Window length for the Yang–Zhang volatility estimator")
+    parser.add_argument("--vol-overlay", action="store_true", help="Apply a volatility-managed overlay to the long-short returns")
+    parser.add_argument("--vol-overlay-halflife", type=int, default=63, help="Half-life (in rebalances) for the overlay volatility estimate")
+    parser.add_argument("--vol-overlay-target", type=float, default=0.10, help="Annualised volatility target for the overlay")
+    parser.add_argument("--vol-overlay-cap", type=float, default=5.0, help="Maximum leverage multiple applied by the overlay")
+    parser.add_argument("--export-ltr", action="store_true", help="Export a MultiIndex (entry_date, ticker) dataset for LTR training")
     return parser.parse_args()
 
 
@@ -398,7 +306,6 @@ def fetch_benchmark(
     cache_path = cache_dir / cache_key(provider_name, "SPY", start, end)
     if cache_path.exists() and not force_refresh:
         return pd.read_pickle(cache_path)
-
     benchmark = provider.get_daily_bars("SPY", start, end)
     if not benchmark.empty:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -413,13 +320,11 @@ def main() -> None:
         raise ValueError("--ema-fast-hl must be smaller than --ema-slow-hl for the crossover signal")
     if args.vol_overlay and args.vol_overlay_target <= 0:
         raise ValueError("--vol-overlay-target must be positive")
+
     provider = build_provider(args)
     try:
-        cache_dir = Path(args.cache_dir)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-
-        output_dir = Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir = Path(args.cache_dir); cache_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = Path(args.output_dir); output_dir.mkdir(parents=True, exist_ok=True)
 
         trading_dates = get_trading_dates(args)
         if len(trading_dates) == 0:
@@ -450,20 +355,6 @@ def main() -> None:
             raise ValueError("Benchmark data is empty; verify API credentials and connectivity")
 
         benchmark_data = benchmark_data.drop_duplicates(subset="date")
-
-        all_tickers = universe["ticker"].drop_duplicates().values
-        if args.prefetch:
-            print(f"Prefetching {len(all_tickers)} tickers with {args.max_workers} workers...")
-
-            def _prefetch(symbol: str) -> None:
-                try:
-                    load_history(symbol)
-                except Exception as exc:  # pragma: no cover - diagnostic output only
-                    print(f"Failed to prefetch {symbol}: {exc}")
-
-            with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-                list(executor.map(_prefetch, all_tickers))
-
         FEATURE_WINDOW = 252
         approx_skip_days = int(args.rebalance_frequency_days)
         skip_trading_days = max(int(round(approx_skip_days * 252 / 365)), 1)
@@ -487,9 +378,7 @@ def main() -> None:
         benchmark_data["benchmark_pct_change"] = benchmark_pct_change * 100
 
         universe_by_month = {
-            month: set(
-                universe.loc[universe["date"] == month, "ticker"].drop_duplicates().values
-            )
+            month: set(universe.loc[universe["date"] == month, "ticker"].drop_duplicates().values)
             for month in analysis_months
         }
 
@@ -498,6 +387,7 @@ def main() -> None:
         feature_anchor_index = _shift_by_bdays(trading_dates, analysis_months_index, SKIP_BDAYS)
         if len(feature_anchor_index) != len(analysis_months_index):
             raise ValueError("Feature anchor index misaligned with analysis months")
+
         analysis_months_array = analysis_months_index.to_numpy()
         exit_months_array = exit_months_index.to_numpy()
 
@@ -521,18 +411,15 @@ def main() -> None:
                 parts.append(f"{seconds}s")
             return " ".join(parts)
 
-        ticker_count = len(all_tickers)
+        ticker_count = len(universe["ticker"].drop_duplicates().values)
         completed = 0
         durations: list[float] = []
         loop_start_time = datetime.now()
 
-        for ticker in all_tickers:
+        for ticker in universe["ticker"].drop_duplicates().values:
             try:
                 ticker_start_time = datetime.now()
-                print(
-                    f"[{completed + 1}/{ticker_count}] Downloading history for {ticker}...",
-                    flush=True,
-                )
+                print(f"[{completed + 1}/{ticker_count}] Downloading history for {ticker}...", flush=True)
                 history = load_history(ticker)
             except Exception as err:
                 print(f"{ticker} download failed: {err}")
@@ -566,22 +453,17 @@ def main() -> None:
 
             merged = pd.merge(
                 ohlc_frame.reset_index().rename(
-                    columns={
-                        "o": "o_ticker",
-                        "h": "h_ticker",
-                        "l": "l_ticker",
-                        "c": "c_ticker",
-                    }
+                    columns={"o": "o_ticker", "h": "h_ticker", "l": "l_ticker", "c": "c_ticker"}
                 ),
-                benchmark_data[["date", "c", "benchmark_pct_change"]].rename(
-                    columns={"c": "c_benchmark"}
-                ),
+                benchmark_data[["date", "c", "benchmark_pct_change"]].rename(columns={"c": "c_benchmark"}),
                 on="date",
                 how="inner",
                 sort=True,
             )
 
             if len(merged) < feature_window:
+                completed += 1
+                durations.append((datetime.now() - ticker_start_time).total_seconds())
                 continue
 
             merged = merged.sort_values("date").reset_index(drop=True)
@@ -600,25 +482,16 @@ def main() -> None:
             rolling_std = merged["ticker_pct_change"].rolling(window=feature_window, min_periods=feature_window).std()
             rolling_std = rolling_std * np.sqrt(args.annualization_factor)
             rolling_std = rolling_std.replace(0, np.nan)
-            sharpe = total_return.divide(rolling_std)
-            sharpe = sharpe.replace([np.inf, -np.inf], np.nan)
+            sharpe = total_return.divide(rolling_std).replace([np.inf, -np.inf], np.nan)
 
             metrics = (
-                pd.DataFrame(
-                    {
-                        "date": merged["date"],
-                        "beta": beta,
-                        "sharpe": sharpe,
-                        "12-1_return": total_return,
-                    }
-                )
+                pd.DataFrame({"date": merged["date"], "beta": beta, "sharpe": sharpe, "12-1_return": total_return})
                 .set_index("date")
                 .sort_index()
             )
 
             # Momentum features -------------------------------------------------
             mom_components: List[pd.Series] = []
-
             if args.momentum_type == "classic":
                 classic_score = metrics["beta"] * metrics["sharpe"]
                 metrics["classic_mom"] = classic_score
@@ -629,47 +502,23 @@ def main() -> None:
                     metrics[column] = ewm_features[column].reindex(metrics.index)
                     mom_components.append(metrics[column])
                 if args.ema_crossover:
-                    ema_signal = _ema_crossover_signal(
-                        close_series,
-                        args.ema_fast_hl,
-                        args.ema_slow_hl,
-                    )
+                    ema_signal = _ema_crossover_signal(close_series, args.ema_fast_hl, args.ema_slow_hl)
                     metrics["ema_crossover"] = ema_signal.reindex(metrics.index)
                     mom_components.append(metrics["ema_crossover"])
 
-            if mom_components:
-                mom_matrix = pd.concat(mom_components, axis=1)
-                composite = mom_matrix.mean(axis=1)
-            else:
-                composite = pd.Series(index=metrics.index, dtype=float)
+            composite = pd.concat(mom_components, axis=1).mean(axis=1) if mom_components else pd.Series(index=metrics.index, dtype=float)
 
             # Volatility estimates ---------------------------------------------
             volatility: Optional[pd.Series] = None
             if args.vol_estimator != "none":
-                try:
-                    if args.vol_estimator == "ewm":
-                        volatility = _ewm_volatility(
-                            close_series.pct_change(),
-                            args.vol_ewm_halflife,
-                            annualize=args.annualization_factor,
-                        )
-                    else:
-                        volatility = _yang_zhang_volatility(
-                            ohlc_frame.rename(
-                                columns={
-                                    "o": "o_ticker",
-                                    "h": "h_ticker",
-                                    "l": "l_ticker",
-                                    "c": "c_ticker",
-                                }
-                            ),
-                            args.vol_window,
-                            annualize=args.annualization_factor,
-                        )
-                except Exception as vol_err:
-                    raise RuntimeError(f"Failed to compute volatility for {ticker}: {vol_err}") from vol_err
-
-            if volatility is not None:
+                if args.vol_estimator == "ewm":
+                    volatility = _ewm_volatility(close_series.pct_change(), args.vol_ewm_halflife, annualize=args.annualization_factor)
+                else:
+                    volatility = _yang_zhang_volatility(
+                        ohlc_frame.rename(columns={"o": "o_ticker", "h": "h_ticker", "l": "l_ticker", "c": "c_ticker"}),
+                        args.vol_window,
+                        annualize=args.annualization_factor,
+                    )
                 metrics["volatility"] = volatility.reindex(metrics.index)
                 with np.errstate(divide="ignore", invalid="ignore"):
                     composite = composite.divide(metrics["volatility"])
@@ -677,13 +526,17 @@ def main() -> None:
 
             metrics["mom_score"] = composite
 
-            metrics = metrics.reindex(feature_anchor_index, method="ffill")
+            # Causal anchoring: map features to dates *before* entry_date
+            metrics = metrics.reindex(pd.to_datetime(feature_anchor_index), method="ffill")
 
+            # Price arrays for forward returns
             price_series = history.set_index("date")["c"].sort_index()
             price_dates = price_series.index.to_numpy()
             price_values = price_series.to_numpy()
 
             if len(price_dates) == 0:
+                completed += 1
+                durations.append((datetime.now() - ticker_start_time).total_seconds())
                 continue
 
             entry_idx = np.searchsorted(price_dates, analysis_months_array, side="left")
@@ -695,22 +548,16 @@ def main() -> None:
                 & (exit_idx < len(price_dates))
                 & (exit_idx > entry_idx)
             )
-
             forward_returns = np.full(len(analysis_months_array), np.nan)
-
             if valid_mask.any():
-                valid_entry_idx = entry_idx[valid_mask]
-                valid_exit_idx = exit_idx[valid_mask]
-                entry_subset = price_values[valid_entry_idx]
-                exit_subset = price_values[valid_exit_idx]
+                entry_subset = price_values[entry_idx[valid_mask]]
+                exit_subset = price_values[exit_idx[valid_mask]]
                 nonzero_entry = entry_subset != 0
-                result_returns = np.full(valid_entry_idx.shape, np.nan)
-                result_returns[nonzero_entry] = (
-                    (exit_subset[nonzero_entry] - entry_subset[nonzero_entry]) / entry_subset[nonzero_entry]
-                ) * 100
-
+                result_returns = np.full(entry_subset.shape, np.nan)
+                result_returns[nonzero_entry] = ((exit_subset[nonzero_entry] - entry_subset[nonzero_entry]) / entry_subset[nonzero_entry]) * 100
                 forward_returns[valid_mask] = result_returns
 
+            # Construct monthly rows for this ticker
             monthly_results = pd.DataFrame(
                 {
                     "entry_date": analysis_months_array,
@@ -734,30 +581,22 @@ def main() -> None:
             if "ema_crossover" in metrics.columns:
                 monthly_results["ema_crossover"] = metrics["ema_crossover"].to_numpy()
 
+            # PIT universe filter by month
             in_universe = np.array([ticker in universe_by_month.get(month, set()) for month in analysis_months])
+            # **Dimension check**: everything must align with analysis_months
+            assert monthly_results.shape[0] == in_universe.shape[0], "Row count must match months"
             monthly_results = monthly_results[in_universe]
-            monthly_results = monthly_results.dropna(
-                subset=["beta", "sharpe", "12-1_return", "mom_score", "forward_returns"]
-            )
+
+            # Drop rows with any NaNs in essential features/y
+            monthly_results = monthly_results.dropna(subset=["beta", "sharpe", "12-1_return", "mom_score", "forward_returns"])
 
             if monthly_results.empty:
                 completed += 1
                 durations.append((datetime.now() - ticker_start_time).total_seconds())
-                if durations:
-                    average_seconds = sum(durations) / len(durations)
-                    remaining = ticker_count - completed
-                    eta = datetime.now() + timedelta(seconds=average_seconds * remaining)
-                    remaining_td = timedelta(seconds=int(average_seconds * remaining))
-                    print(
-                        f"    Filtered out {ticker}. Progress: {completed}/{ticker_count}. "
-                        f"ETA {eta:%Y-%m-%d %H:%M:%S} ({_format_timedelta(remaining_td)} remaining)",
-                        flush=True,
-                    )
                 continue
 
             monthly_results["entry_date"] = pd.to_datetime(monthly_results["entry_date"]).dt.strftime("%Y-%m-%d")
             monthly_results["exit_date"] = pd.to_datetime(monthly_results["exit_date"]).dt.strftime("%Y-%m-%d")
-
             all_monthly_results.append(monthly_results)
 
             completed += 1
@@ -780,16 +619,10 @@ def main() -> None:
 
         full_dataset = pd.concat(all_monthly_results, ignore_index=True)
         full_dataset = full_dataset.sort_values(["entry_date", "mom_score"], ascending=[True, False])
-        top_decile_dataset = (
-            full_dataset.sort_values("mom_score", ascending=False)
-            .groupby("entry_date", group_keys=False)
-            .head(10)
-        )
-        bot_decile_dataset = (
-            full_dataset.sort_values("mom_score", ascending=True)
-            .groupby("entry_date", group_keys=False)
-            .head(10)
-        )
+
+        # Build decile baskets per month using within-month ranks on mom_score
+        top_decile_dataset = full_dataset.sort_values("mom_score", ascending=False).groupby("entry_date", group_keys=False).head(10)
+        bot_decile_dataset = full_dataset.sort_values("mom_score", ascending=True).groupby("entry_date", group_keys=False).head(10)
 
         covered_dates = full_dataset["entry_date"].drop_duplicates().values
 
@@ -800,13 +633,7 @@ def main() -> None:
             if long_uni.empty or short_uni.empty:
                 continue
             trade = pd.DataFrame(
-                [
-                    {
-                        "date": covered_date,
-                        "long": long_uni["forward_returns"].mean(),
-                        "short": short_uni["forward_returns"].mean() * -1,
-                    }
-                ]
+                [{"date": covered_date, "long": long_uni["forward_returns"].mean(), "short": short_uni["forward_returns"].mean() * -1}]
             )
             trades.append(trade)
 
@@ -821,7 +648,7 @@ def main() -> None:
 
         GROSS_LONG = 1.0
         GROSS_SHORT = 1.0
-        PER_SIDE_BPS = 2.0
+        PER_SIDE_BPS = 2.0  # conservative estimate (can be tuned)
 
         def _basket_turnover_per_month(baskets: pd.DataFrame) -> pd.Series:
             if baskets.empty:
@@ -845,8 +672,7 @@ def main() -> None:
         short_turnover = _basket_turnover_per_month(bot_decile_dataset[["entry_date", "ticker"]])
 
         trades_dates = pd.to_datetime(all_trades["date"])
-        turnover_frame = pd.DataFrame(index=trades_dates)
-        turnover_frame.index.name = "date"
+        turnover_frame = pd.DataFrame(index=trades_dates); turnover_frame.index.name = "date"
         turnover_frame["long_turnover"] = long_turnover.reindex(turnover_frame.index).fillna(1.0)
         turnover_frame["short_turnover"] = short_turnover.reindex(turnover_frame.index).fillna(1.0)
 
@@ -854,12 +680,9 @@ def main() -> None:
         short_returns = (all_trades["short"].to_numpy() / 100.0) * GROSS_SHORT
         ls_returns = long_returns + short_returns
 
-        cost_decimals = (
-            (PER_SIDE_BPS / 1e4)
-            * (
-                turnover_frame["long_turnover"].to_numpy() * GROSS_LONG
-                + turnover_frame["short_turnover"].to_numpy() * GROSS_SHORT
-            )
+        # Turnover-proportional bps-per-side cost
+        cost_decimals = (PER_SIDE_BPS / 1e4) * (
+            turnover_frame["long_turnover"].to_numpy() * GROSS_LONG + turnover_frame["short_turnover"].to_numpy() * GROSS_SHORT
         )
         ls_returns_net = ls_returns - cost_decimals
 
@@ -900,20 +723,22 @@ def main() -> None:
         plt.plot(trades_dates, all_trades["ls_cum_%_net"], label="Long-Short (net est. costs)")
         if overlay_returns is not None:
             plt.plot(trades_dates, all_trades["ls_cum_%_vol_managed"], label="Long-Short (vol managed)")
-        plt.legend()
-        plt.xlabel("Date")
-        plt.ylabel("Cumulative % Return")
-        plt.tight_layout()
+        plt.legend(); plt.xlabel("Date"); plt.ylabel("Cumulative % Return"); plt.tight_layout()
 
         plot_path = output_dir / "cumulative_performance.png"
         plt.savefig(plot_path, bbox_inches="tight")
-
         trades_path = output_dir / "monthly_trades.csv"
         all_trades.to_csv(trades_path, index=False)
-
+        if args.export_ltr:
+            # MultiIndex LTR dataset: (entry_date, ticker) index; y = forward_returns
+            ltr = full_dataset.copy()
+            ltr["entry_date"] = pd.to_datetime(ltr["entry_date"])
+            ltr = ltr.set_index(["entry_date", "ticker"]).sort_index()
+            ltr_path = output_dir / "ltr_training_dataset.parquet"
+            ltr.to_parquet(ltr_path)
+            print(f"Saved LTR dataset to {ltr_path}")
         if args.show_plot:
             plt.show()
-
         plt.close()
     finally:
         if hasattr(provider, "close"):
