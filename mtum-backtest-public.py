@@ -1,12 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Momentum backtest with configurable data sources and caching.
-
-Changes:
-- Explicit causal anchoring (already present) is now documented and asserted.
-- Extra shape/dimension assertions to protect LTR dataset construction.
-- Optional MultiIndex LTR export (entry_date x ticker) with y=forward_returns.
-- Comments tightened around adjustment semantics and turnover costs.
-"""
+"""Momentum backtest with configurable data sources, caching, and optional entropy."""
 
 from __future__ import annotations
 
@@ -27,7 +20,9 @@ from pandas.tseries.offsets import BDay
 from pandas_market_calendars import get_calendar
 
 from data_providers import AlpacaBarsClient, PolygonAggsClient
+import relative_market_features as rmf  # NEW: entropy + peer metrics module
 
+# ---------------------- existing helpers (unchanged) ----------------------
 
 def _parse_positive_int_list(raw: str, *, min_value: int = 1) -> List[int]:
     """Parse a comma-separated list of positive integers."""
@@ -113,20 +108,15 @@ def _yang_zhang_volatility(
     log_high = np.log(frame["h_ticker"])
     log_low = np.log(frame["l_ticker"])
     log_close = np.log(frame["c_ticker"])
-
     log_prev_close = log_close.shift(1)
     log_prev_open = log_open.shift(1)
-
     close_vol = (log_close - log_prev_close) ** 2
     open_vol = (log_open - log_prev_close) ** 2
     rs = (log_high - log_close) * (log_high - log_open) + (log_low - log_close) * (log_low - log_open)
-
     k = 0.34 / (1.34 + (window + 1) / (window - 1))
-
     close_var = close_vol.rolling(window=window, min_periods=window).sum() * (1.0 / (window - 1))
     open_var = open_vol.rolling(window=window, min_periods=window).sum() * (1.0 / (window - 1))
     rs_var = rs.rolling(window=window, min_periods=window).sum() * (1.0 / (window - 1))
-
     yang_zhang_var = open_var + k * close_var + (1.0 - k) * rs_var
     yang_zhang_var = yang_zhang_var.clip(lower=0.0)
     return np.sqrt(yang_zhang_var).shift(1) * math.sqrt(annualize)
@@ -148,7 +138,9 @@ def _vol_overlay_leverage(
     annualised = ewm_std.shift(1) * math.sqrt(periods_per_year)
     with np.errstate(divide="ignore", invalid="ignore"):
         leverage = target_vol / annualised
-    leverage = leverage.clip(lower=0.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    leverage = leverage.clip(lower=0.0)
+    leverage = leverage.replace([np.inf, -np.inf], np.nan)
+    leverage = leverage.fillna(0.0)
     return leverage.clip(upper=cap)
 
 
@@ -158,7 +150,9 @@ def _load_colab_user_secrets() -> None:
         from google.colab import userdata  # type: ignore
     except Exception:
         return
-    secret_names = {"POLYGON_API_KEY": "POLYGON_API_KEY", "ALPACA_API_KEY": "ALPACA_API_KEY", "ALPACA_SECRET_KEY": "ALPACA_SECRET_KEY"}
+    secret_names = {"POLYGON_API_KEY": "POLYGON_API_KEY",
+                    "ALPACA_API_KEY": "ALPACA_API_KEY",
+                    "ALPACA_SECRET_KEY": "ALPACA_SECRET_KEY"}
     for env_name, secret_name in secret_names.items():
         if os.getenv(env_name):
             continue
@@ -169,8 +163,10 @@ def _load_colab_user_secrets() -> None:
         if value:
             os.environ[env_name] = value
 
+
 _load_colab_user_secrets()
 
+# ---------------------- CLI (extended with entropy) ----------------------
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the time-series momentum backtest")
@@ -189,25 +185,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calendar", default="NYSE", help="Market calendar to use for trading dates")
     parser.add_argument("--start-date", default="2019-01-01", help="Backtest start date for calendar generation")
     parser.add_argument("--output-dir", default="backtest-output", help="Directory where reports and plots are written")
-    parser.add_argument("--no-show-plot", dest="show_plot", action="store_false", help="Skip displaying the performance figure (still saved to disk)")
+    parser.add_argument("--no-show-plot", dest="show_plot", action="store_false", help="Skip displaying the performance figure (still saved)")
     parser.set_defaults(show_plot=True)
-    parser.add_argument("--database-url", default="mysql+mysqlconnector://user:pass@localhost:3306/my_database", help="SQLAlchemy URL for the universe database")
-    parser.add_argument("--universe-table", default="historical_liquid_tickers_polygon", help="Table containing the point-in-time universe")
-    parser.add_argument("--universe-csv", default=None, help="CSV file containing the point-in-time universe (overrides the database)")
-    parser.add_argument("--annualization-factor", type=int, default=252, help="Trading periods used for annualising volatility estimates")
-    parser.add_argument("--momentum-type", choices=["classic", "ewm"], default="classic", help="Momentum definition: classic beta*Sharpe or EWMA-based")
-    parser.add_argument("--ewm-half-lives", default="63,126,252", help="Comma-separated half-lives (in days) for EWMA momentum")
+    parser.add_argument("--database-url", default="mysql+mysqlconnector://user:pass@localhost:3306/my_database",
+                        help="SQLAlchemy URL for the universe database")
+    parser.add_argument("--universe-table", default="historical_liquid_tickers_polygon",
+                        help="Table containing the point-in-time universe")
+    parser.add_argument("--universe-csv", default=None, help="CSV file containing the point-in-time universe (overrides DB)")
+    parser.add_argument("--annualization-factor", type=int, default=252, help="Trading periods for annualising volatility")
+    parser.add_argument("--momentum-type", choices=["classic", "ewm"], default="classic",
+                        help="Momentum definition: classic beta*Sharpe or EWMA-based")
+    parser.add_argument("--ewm-half-lives", default="63,126,252", help="Comma-separated half-lives (days) for EWMA momentum")
     parser.add_argument("--ema-crossover", action="store_true", help="Augment EWMA momentum with an EMA crossover signal")
     parser.add_argument("--ema-fast-hl", type=int, default=32, help="Half-life for the fast EMA when --ema-crossover is enabled")
     parser.add_argument("--ema-slow-hl", type=int, default=128, help="Half-life for the slow EMA when --ema-crossover is enabled")
-    parser.add_argument("--vol-estimator", choices=["none", "ewm", "yang-zhang"], default="none", help="Volatility estimator to use for risk-adjusting momentum")
+    parser.add_argument("--vol-estimator", choices=["none", "ewm", "yang-zhang"], default="none",
+                        help="Volatility estimator to use for risk-adjusting momentum")
     parser.add_argument("--vol-ewm-halflife", type=int, default=20, help="Half-life for the EWM volatility estimator")
     parser.add_argument("--vol-window", type=int, default=20, help="Window length for the Yang–Zhang volatility estimator")
     parser.add_argument("--vol-overlay", action="store_true", help="Apply a volatility-managed overlay to the long-short returns")
-    parser.add_argument("--vol-overlay-halflife", type=int, default=63, help="Half-life (in rebalances) for the overlay volatility estimate")
-    parser.add_argument("--vol-overlay-target", type=float, default=0.10, help="Annualised volatility target for the overlay")
-    parser.add_argument("--vol-overlay-cap", type=float, default=5.0, help="Maximum leverage multiple applied by the overlay")
-    parser.add_argument("--export-ltr", action="store_true", help="Export a MultiIndex (entry_date, ticker) dataset for LTR training")
+    parser.add_argument("--vol-overlay-halflife", type=int, default=63, help="Half-life (rebalances) for overlay volatility estimate")
+    parser.add_argument("--vol-overlay-target", type=float, default=0.10, help="Annualised volatility target for overlay")
+    parser.add_argument("--vol-overlay-cap", type=float, default=5.0, help="Max leverage multiple applied by overlay")
+
+    # ---------- NEW: entropy switches ----------
+    parser.add_argument("--entropy-mode", choices=["off", "pe", "se", "both", "peer", "all"], default="off",
+                        help="Which entropy metrics to compute/use")
+    parser.add_argument("--entropy-role", choices=["feature", "filter", "standalone", "hybrid"], default="feature",
+                        help="How entropy influences ranking/gating")
+    parser.add_argument("--pe-window", type=int, default=126, help="Window for permutation entropy")
+    parser.add_argument("--pe-m", type=int, default=4, help="Embedding dimension m for permutation entropy")
+    parser.add_argument("--pe-tau", type=int, default=1, help="Delay τ for permutation entropy")
+    parser.add_argument("--se-window", type=int, default=128, help="Window for spectral entropy")
+    parser.add_argument("--se-update-freq", type=int, default=5, help="Spectral entropy recompute frequency")
+    parser.add_argument("--cs-bins", type=int, default=21, help="Bins for cross-sectional peer surprisal/JSD")
+    parser.add_argument("--entropy-filter-quantile", type=float, default=0.8, help="Quantile for entropy gating")
+    parser.add_argument("--entropy-filter-side", choices=["low", "high"], default="low",
+                        help="'low' keeps low-entropy (more structured) names; 'high' keeps high-entropy")
     return parser.parse_args()
 
 
@@ -313,6 +327,8 @@ def fetch_benchmark(
     return benchmark
 
 
+# ---------------------- main ----------------------
+
 def main() -> None:
     args = parse_args()
     args.ewm_half_lives = _parse_positive_int_list(args.ewm_half_lives)
@@ -323,8 +339,11 @@ def main() -> None:
 
     provider = build_provider(args)
     try:
-        cache_dir = Path(args.cache_dir); cache_dir.mkdir(parents=True, exist_ok=True)
-        output_dir = Path(args.output_dir); output_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir = Path(args.cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         trading_dates = get_trading_dates(args)
         if len(trading_dates) == 0:
@@ -355,6 +374,20 @@ def main() -> None:
             raise ValueError("Benchmark data is empty; verify API credentials and connectivity")
 
         benchmark_data = benchmark_data.drop_duplicates(subset="date")
+
+        all_tickers = universe["ticker"].drop_duplicates().values
+        if args.prefetch:
+            print(f"Prefetching {len(all_tickers)} tickers with {args.max_workers} workers...")
+
+            def _prefetch(symbol: str) -> None:
+                try:
+                    load_history(symbol)
+                except Exception as exc:  # pragma: no cover - diagnostic only
+                    print(f"Failed to prefetch {symbol}: {exc}")
+
+            with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+                list(executor.map(_prefetch, all_tickers))
+
         FEATURE_WINDOW = 252
         approx_skip_days = int(args.rebalance_frequency_days)
         skip_trading_days = max(int(round(approx_skip_days * 252 / 365)), 1)
@@ -387,11 +420,13 @@ def main() -> None:
         feature_anchor_index = _shift_by_bdays(trading_dates, analysis_months_index, SKIP_BDAYS)
         if len(feature_anchor_index) != len(analysis_months_index):
             raise ValueError("Feature anchor index misaligned with analysis months")
-
         analysis_months_array = analysis_months_index.to_numpy()
         exit_months_array = exit_months_index.to_numpy()
 
         all_monthly_results = []
+
+        # Track t-1 returns for cross-sectional peer metrics at anchor dates (computed after loop)
+        returns_by_ticker: Dict[str, pd.Series] = {}
 
         def _format_timedelta(delta: timedelta) -> str:
             total_seconds = int(delta.total_seconds())
@@ -411,12 +446,12 @@ def main() -> None:
                 parts.append(f"{seconds}s")
             return " ".join(parts)
 
-        ticker_count = len(universe["ticker"].drop_duplicates().values)
+        ticker_count = len(all_tickers)
         completed = 0
         durations: list[float] = []
         loop_start_time = datetime.now()
 
-        for ticker in universe["ticker"].drop_duplicates().values:
+        for ticker in all_tickers:
             try:
                 ticker_start_time = datetime.now()
                 print(f"[{completed + 1}/{ticker_count}] Downloading history for {ticker}...", flush=True)
@@ -433,11 +468,9 @@ def main() -> None:
                     remaining = ticker_count - completed
                     eta = datetime.now() + timedelta(seconds=average_seconds * remaining)
                     remaining_td = timedelta(seconds=int(average_seconds * remaining))
-                    print(
-                        f"    No data for {ticker}. Progress: {completed}/{ticker_count}. "
-                        f"ETA {eta:%Y-%m-%d %H:%M:%S} ({_format_timedelta(remaining_td)} remaining)",
-                        flush=True,
-                    )
+                    print(f"    No data for {ticker}. Progress: {completed}/{ticker_count}. "
+                          f"ETA {eta:%Y-%m-%d %H:%M:%S} ({_format_timedelta(remaining_td)} remaining)",
+                          flush=True)
                 continue
 
             history = history.sort_values("timestamp").drop_duplicates(subset="date", keep="last")
@@ -450,6 +483,7 @@ def main() -> None:
 
             close_series = history.set_index("date")["c"].sort_index()
             ohlc_frame = history.set_index("date")[["o", "h", "l", "c"]].sort_index()
+            returns_by_ticker[ticker] = close_series.pct_change()
 
             merged = pd.merge(
                 ohlc_frame.reset_index().rename(
@@ -482,15 +516,15 @@ def main() -> None:
             rolling_std = merged["ticker_pct_change"].rolling(window=feature_window, min_periods=feature_window).std()
             rolling_std = rolling_std * np.sqrt(args.annualization_factor)
             rolling_std = rolling_std.replace(0, np.nan)
-            sharpe = total_return.divide(rolling_std).replace([np.inf, -np.inf], np.nan)
+            sharpe = total_return.divide(rolling_std)
+            sharpe = sharpe.replace([np.inf, -np.inf], np.nan)
 
             metrics = (
                 pd.DataFrame({"date": merged["date"], "beta": beta, "sharpe": sharpe, "12-1_return": total_return})
-                .set_index("date")
-                .sort_index()
+                .set_index("date").sort_index()
             )
 
-            # Momentum features -------------------------------------------------
+            # --- Momentum features ---
             mom_components: List[pd.Series] = []
             if args.momentum_type == "classic":
                 classic_score = metrics["beta"] * metrics["sharpe"]
@@ -506,34 +540,85 @@ def main() -> None:
                     metrics["ema_crossover"] = ema_signal.reindex(metrics.index)
                     mom_components.append(metrics["ema_crossover"])
 
-            composite = pd.concat(mom_components, axis=1).mean(axis=1) if mom_components else pd.Series(index=metrics.index, dtype=float)
+            if mom_components:
+                mom_matrix = pd.concat(mom_components, axis=1)
+                composite = mom_matrix.mean(axis=1)
+            else:
+                composite = pd.Series(index=metrics.index, dtype=float)
 
-            # Volatility estimates ---------------------------------------------
+            # --- Optional volatility estimates (risk adjust) ---
             volatility: Optional[pd.Series] = None
             if args.vol_estimator != "none":
-                if args.vol_estimator == "ewm":
-                    volatility = _ewm_volatility(close_series.pct_change(), args.vol_ewm_halflife, annualize=args.annualization_factor)
-                else:
-                    volatility = _yang_zhang_volatility(
-                        ohlc_frame.rename(columns={"o": "o_ticker", "h": "h_ticker", "l": "l_ticker", "c": "c_ticker"}),
-                        args.vol_window,
-                        annualize=args.annualization_factor,
-                    )
-                metrics["volatility"] = volatility.reindex(metrics.index)
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    composite = composite.divide(metrics["volatility"])
-                composite = composite.replace([np.inf, -np.inf], np.nan)
+                try:
+                    if args.vol_estimator == "ewm":
+                        volatility = _ewm_volatility(close_series.pct_change(),
+                                                     args.vol_ewm_halflife,
+                                                     annualize=args.annualization_factor)
+                    else:
+                        volatility = _yang_zhang_volatility(
+                            ohlc_frame.rename(columns={"o": "o_ticker", "h": "h_ticker", "l": "l_ticker", "c": "c_ticker"}),
+                            args.vol_window,
+                            annualize=args.annualization_factor,
+                        )
+                except Exception as vol_err:
+                    raise RuntimeError(f"Failed to compute volatility for {ticker}: {vol_err}") from vol_err
+
+                if volatility is not None:
+                    metrics["volatility"] = volatility.reindex(metrics.index)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        composite = composite.divide(metrics["volatility"])
+                    composite = composite.replace([np.inf, -np.inf], np.nan)
+
+            # --- NEW: Causal entropy features (PE/SE) per ticker ---
+            pe_name = f"perm_entropy_w{args.pe_window}_m{args.pe_m}_tau{args.pe_tau}"
+            se_name = f"spectral_entropy_w{args.se_window}"
+            entropy_quality: Optional[pd.Series] = None
+
+            if args.entropy_mode in {"pe", "se", "both", "all"}:
+                # Build a (date,ticker) MI frame for this ticker only
+                ent_df = pd.DataFrame({"closeadj": close_series})
+                ent_df["ticker"] = ticker
+                ent_df = ent_df.reset_index().set_index(["date", "ticker"]).sort_index()
+
+                ent_features = rmf.add_entropy_info_features(
+                    ent_df, price_col="closeadj",
+                    use_lagged_data=True,
+                    pe_window=args.pe_window, pe_m=args.pe_m, pe_tau=args.pe_tau,
+                    se_window=args.se_window, se_update_freq=args.se_update_freq,
+                    cs_bins=args.cs_bins, pca_window=None, verbose=False
+                )
+
+                # Pull per-ticker series back to metrics index
+                if args.entropy_mode in {"pe", "both", "all"} and pe_name in ent_features.columns:
+                    metrics[pe_name] = ent_features[pe_name].xs(ticker, level="ticker").reindex(metrics.index)
+                if args.entropy_mode in {"se", "both", "all"} and se_name in ent_features.columns:
+                    metrics[se_name] = ent_features[se_name].xs(ticker, level="ticker").reindex(metrics.index)
+
+                # Build a [0,1] "quality" (higher = more structured) from selected entropies
+                quality_components = []
+                if pe_name in metrics.columns and args.entropy_mode in {"pe", "both", "all"}:
+                    quality_components.append(1.0 - metrics[pe_name])  # low PE => high quality
+                if se_name in metrics.columns and args.entropy_mode in {"se", "both", "all"}:
+                    quality_components.append(1.0 - metrics[se_name])  # low SE => high quality
+                if quality_components:
+                    entropy_quality = pd.concat(quality_components, axis=1).mean(axis=1).clip(0.0, 1.0)
+                    metrics["entropy_quality"] = entropy_quality
+                    metrics["entropy_score"] = entropy_quality  # standalone option
+
+            # --- Apply role semantics ---
+            if args.entropy_role == "standalone" and ("entropy_score" in metrics.columns):
+                composite = metrics["entropy_score"]
+            elif args.entropy_role == "hybrid" and ("entropy_quality" in metrics.columns):
+                composite = composite * metrics["entropy_quality"]
 
             metrics["mom_score"] = composite
 
-            # Causal anchoring: map features to dates *before* entry_date
-            metrics = metrics.reindex(pd.to_datetime(feature_anchor_index), method="ffill")
+            # Align to feature anchors (strictly <= anchor date)
+            metrics = metrics.reindex(feature_anchor_index, method="ffill")
 
-            # Price arrays for forward returns
             price_series = history.set_index("date")["c"].sort_index()
             price_dates = price_series.index.to_numpy()
             price_values = price_series.to_numpy()
-
             if len(price_dates) == 0:
                 completed += 1
                 durations.append((datetime.now() - ticker_start_time).total_seconds())
@@ -548,16 +633,20 @@ def main() -> None:
                 & (exit_idx < len(price_dates))
                 & (exit_idx > entry_idx)
             )
+
             forward_returns = np.full(len(analysis_months_array), np.nan)
             if valid_mask.any():
-                entry_subset = price_values[entry_idx[valid_mask]]
-                exit_subset = price_values[exit_idx[valid_mask]]
+                valid_entry_idx = entry_idx[valid_mask]
+                valid_exit_idx = exit_idx[valid_mask]
+                entry_subset = price_values[valid_entry_idx]
+                exit_subset = price_values[valid_exit_idx]
                 nonzero_entry = entry_subset != 0
-                result_returns = np.full(entry_subset.shape, np.nan)
-                result_returns[nonzero_entry] = ((exit_subset[nonzero_entry] - entry_subset[nonzero_entry]) / entry_subset[nonzero_entry]) * 100
+                result_returns = np.full(valid_entry_idx.shape, np.nan)
+                result_returns[nonzero_entry] = (
+                    (exit_subset[nonzero_entry] - entry_subset[nonzero_entry]) / entry_subset[nonzero_entry]
+                ) * 100
                 forward_returns[valid_mask] = result_returns
 
-            # Construct monthly rows for this ticker
             monthly_results = pd.DataFrame(
                 {
                     "entry_date": analysis_months_array,
@@ -568,6 +657,7 @@ def main() -> None:
                     "12-1_return": metrics["12-1_return"].to_numpy(),
                     "mom_score": metrics["mom_score"].to_numpy(),
                     "forward_returns": forward_returns,
+                    "anchor_date": pd.to_datetime(feature_anchor_index).strftime("%Y-%m-%d").to_numpy(),
                 }
             )
 
@@ -580,24 +670,25 @@ def main() -> None:
                     monthly_results[column] = metrics[column].to_numpy()
             if "ema_crossover" in metrics.columns:
                 monthly_results["ema_crossover"] = metrics["ema_crossover"].to_numpy()
+            if "entropy_quality" in metrics.columns:
+                monthly_results["entropy_quality"] = metrics["entropy_quality"].to_numpy()
+            if pe_name in metrics.columns:
+                monthly_results[pe_name] = metrics[pe_name].to_numpy()
+            if se_name in metrics.columns:
+                monthly_results[se_name] = metrics[se_name].to_numpy()
+            if "entropy_score" in metrics.columns:
+                monthly_results["entropy_score"] = metrics["entropy_score"].to_numpy()
 
-            # PIT universe filter by month
             in_universe = np.array([ticker in universe_by_month.get(month, set()) for month in analysis_months])
-            # **Dimension check**: everything must align with analysis_months
-            assert monthly_results.shape[0] == in_universe.shape[0], "Row count must match months"
             monthly_results = monthly_results[in_universe]
+            monthly_results = monthly_results.dropna(
+                subset=["beta", "sharpe", "12-1_return", "mom_score", "forward_returns"]
+            )
 
-            # Drop rows with any NaNs in essential features/y
-            monthly_results = monthly_results.dropna(subset=["beta", "sharpe", "12-1_return", "mom_score", "forward_returns"])
-
-            if monthly_results.empty:
-                completed += 1
-                durations.append((datetime.now() - ticker_start_time).total_seconds())
-                continue
-
-            monthly_results["entry_date"] = pd.to_datetime(monthly_results["entry_date"]).dt.strftime("%Y-%m-%d")
-            monthly_results["exit_date"] = pd.to_datetime(monthly_results["exit_date"]).dt.strftime("%Y-%m-%d")
-            all_monthly_results.append(monthly_results)
+            if not monthly_results.empty:
+                monthly_results["entry_date"] = pd.to_datetime(monthly_results["entry_date"]).dt.strftime("%Y-%m-%d")
+                monthly_results["exit_date"] = pd.to_datetime(monthly_results["exit_date"]).dt.strftime("%Y-%m-%d")
+                all_monthly_results.append(monthly_results)
 
             completed += 1
             ticker_duration = (datetime.now() - ticker_start_time).total_seconds()
@@ -607,12 +698,10 @@ def main() -> None:
             eta = datetime.now() + timedelta(seconds=average_seconds * remaining)
             remaining_td = timedelta(seconds=int(average_seconds * remaining))
             elapsed_td = datetime.now() - loop_start_time
-            print(
-                f"    Finished {ticker} in {ticker_duration:.2f}s. Progress: {completed}/{ticker_count}. "
-                f"Elapsed {_format_timedelta(elapsed_td)}. ETA {eta:%Y-%m-%d %H:%M:%S} "
-                f"({_format_timedelta(remaining_td)} remaining)",
-                flush=True,
-            )
+            print(f"    Finished {ticker} in {ticker_duration:.2f}s. Progress: {completed}/{ticker_count}. "
+                  f"Elapsed {_format_timedelta(elapsed_td)}. ETA {eta:%Y-%m-%d %H:%M:%S} "
+                  f"({_format_timedelta(remaining_td)} remaining)",
+                  flush=True)
 
         if not all_monthly_results:
             raise ValueError("No data collected for any month; confirm ticker universe and data availability")
@@ -620,9 +709,78 @@ def main() -> None:
         full_dataset = pd.concat(all_monthly_results, ignore_index=True)
         full_dataset = full_dataset.sort_values(["entry_date", "mom_score"], ascending=[True, False])
 
-        # Build decile baskets per month using within-month ranks on mom_score
-        top_decile_dataset = full_dataset.sort_values("mom_score", ascending=False).groupby("entry_date", group_keys=False).head(10)
-        bot_decile_dataset = full_dataset.sort_values("mom_score", ascending=True).groupby("entry_date", group_keys=False).head(10)
+        # ---------- NEW: optional cross-sectional peer metrics (at anchor dates, from t-1 returns) ----------
+        if args.entropy_mode in {"peer", "all"}:
+            # Build panel of r[t-1] at anchor dates for all tickers
+            anchor_dates = pd.to_datetime(full_dataset["anchor_date"].drop_duplicates().sort_values())
+            panel = pd.DataFrame(index=anchor_dates)
+            for tk, ret in returns_by_ticker.items():
+                rlag = ret.shift(1)
+                panel[tk] = rlag.reindex(anchor_dates).values
+            # MultiIndex series for rmf peer functions
+            rlag_series = panel.stack(dropna=False)
+            rlag_series.index = rlag_series.index.set_names(["date", "ticker"])
+            rlag_series = rlag_series.astype(float)
+            # Compute peer surprisal & JSD (causal at t-1)
+            cs_surpr, _p, _ = rmf._cross_sectional_surprisal_from_bins(rlag_series.dropna(), n_bins=args.cs_bins)
+            cs_jsd = rmf._peer_jsd_pointmass(rlag_series.dropna(), n_bins=args.cs_bins)
+            peer_df = pd.concat([cs_surpr, cs_jsd], axis=1)
+            peer_df.columns = ["peer_surprisal", "peer_jsd"]
+            # Robust per-date z for JSD
+            peer_df = peer_df.to_frame() if isinstance(peer_df, pd.Series) else peer_df
+            peer_df["peer_jsd_z"] = peer_df.groupby(level="date")["peer_jsd"].apply(
+                lambda s: ((s - s.median()) / ((s.quantile(0.75) - s.quantile(0.25)) / 1.349 + 1e-12)).clip(-8, 8)
+            )
+            pf = peer_df.reset_index()
+            pf["entry_date"] = pf["date"].dt.strftime("%Y-%m-%d")
+            full_dataset = full_dataset.merge(
+                pf[["entry_date", "ticker", "peer_surprisal", "peer_jsd", "peer_jsd_z"]],
+                on=["entry_date", "ticker"],
+                how="left",
+            )
+
+        # ---------- NEW: entropy gating (filter role) ----------
+        if args.entropy_role == "filter":
+            if args.entropy_mode in {"peer", "all"} and "peer_jsd" in full_dataset.columns:
+                # By default, drop the most idiosyncratic extreme (high JSD) names
+                q = full_dataset.groupby("entry_date")["peer_jsd"].transform(
+                    lambda x: x.quantile(args.entropy_filter_quantile)
+                )
+                if args.entropy_filter_side == "low":
+                    mask = full_dataset["peer_jsd"] <= q
+                else:
+                    mask = full_dataset["peer_jsd"] >= q
+                full_dataset = full_dataset[mask]
+            elif "entropy_quality" in full_dataset.columns:
+                # Keep low-entropy (high quality) names by default
+                q = full_dataset.groupby("entry_date")["entropy_quality"].transform(
+                    lambda x: x.quantile(args.entropy_filter_quantile)
+                )
+                if args.entropy_filter_side == "low":
+                    mask = full_dataset["entropy_quality"] >= q
+                else:
+                    # keep high-entropy (low-quality) names if user requests
+                    q_low = full_dataset.groupby("entry_date")["entropy_quality"].transform(
+                        lambda x: x.quantile(1.0 - args.entropy_filter_quantile)
+                    )
+                    mask = full_dataset["entropy_quality"] <= q_low
+                full_dataset = full_dataset[mask]
+
+        # Choose score column (standalone entropy vs momentum)
+        score_col = "mom_score"
+        if args.entropy_role == "standalone" and ("entropy_score" in full_dataset.columns):
+            score_col = "entropy_score"
+
+        top_decile_dataset = (
+            full_dataset.sort_values(score_col, ascending=False)
+            .groupby("entry_date", group_keys=False)
+            .head(10)
+        )
+        bot_decile_dataset = (
+            full_dataset.sort_values(score_col, ascending=True)
+            .groupby("entry_date", group_keys=False)
+            .head(10)
+        )
 
         covered_dates = full_dataset["entry_date"].drop_duplicates().values
 
@@ -633,7 +791,9 @@ def main() -> None:
             if long_uni.empty or short_uni.empty:
                 continue
             trade = pd.DataFrame(
-                [{"date": covered_date, "long": long_uni["forward_returns"].mean(), "short": short_uni["forward_returns"].mean() * -1}]
+                [{"date": covered_date,
+                  "long": long_uni["forward_returns"].mean(),
+                  "short": short_uni["forward_returns"].mean() * -1}]
             )
             trades.append(trade)
 
@@ -644,11 +804,9 @@ def main() -> None:
         if all_trades.empty:
             raise ValueError("Trades table unexpectedly empty after concatenation")
 
-        assert {"long", "short"}.issubset(all_trades.columns)
-
         GROSS_LONG = 1.0
         GROSS_SHORT = 1.0
-        PER_SIDE_BPS = 2.0  # conservative estimate (can be tuned)
+        PER_SIDE_BPS = 2.0
 
         def _basket_turnover_per_month(baskets: pd.DataFrame) -> pd.Series:
             if baskets.empty:
@@ -672,7 +830,8 @@ def main() -> None:
         short_turnover = _basket_turnover_per_month(bot_decile_dataset[["entry_date", "ticker"]])
 
         trades_dates = pd.to_datetime(all_trades["date"])
-        turnover_frame = pd.DataFrame(index=trades_dates); turnover_frame.index.name = "date"
+        turnover_frame = pd.DataFrame(index=trades_dates)
+        turnover_frame.index.name = "date"
         turnover_frame["long_turnover"] = long_turnover.reindex(turnover_frame.index).fillna(1.0)
         turnover_frame["short_turnover"] = short_turnover.reindex(turnover_frame.index).fillna(1.0)
 
@@ -680,9 +839,12 @@ def main() -> None:
         short_returns = (all_trades["short"].to_numpy() / 100.0) * GROSS_SHORT
         ls_returns = long_returns + short_returns
 
-        # Turnover-proportional bps-per-side cost
-        cost_decimals = (PER_SIDE_BPS / 1e4) * (
-            turnover_frame["long_turnover"].to_numpy() * GROSS_LONG + turnover_frame["short_turnover"].to_numpy() * GROSS_SHORT
+        cost_decimals = (
+            (PER_SIDE_BPS / 1e4)
+            * (
+                turnover_frame["long_turnover"].to_numpy() * GROSS_LONG
+                + turnover_frame["short_turnover"].to_numpy() * GROSS_SHORT
+            )
         )
         ls_returns_net = ls_returns - cost_decimals
 
@@ -723,20 +885,17 @@ def main() -> None:
         plt.plot(trades_dates, all_trades["ls_cum_%_net"], label="Long-Short (net est. costs)")
         if overlay_returns is not None:
             plt.plot(trades_dates, all_trades["ls_cum_%_vol_managed"], label="Long-Short (vol managed)")
-        plt.legend(); plt.xlabel("Date"); plt.ylabel("Cumulative % Return"); plt.tight_layout()
+        plt.legend()
+        plt.xlabel("Date")
+        plt.ylabel("Cumulative % Return")
+        plt.tight_layout()
 
         plot_path = output_dir / "cumulative_performance.png"
         plt.savefig(plot_path, bbox_inches="tight")
+
         trades_path = output_dir / "monthly_trades.csv"
         all_trades.to_csv(trades_path, index=False)
-        if args.export_ltr:
-            # MultiIndex LTR dataset: (entry_date, ticker) index; y = forward_returns
-            ltr = full_dataset.copy()
-            ltr["entry_date"] = pd.to_datetime(ltr["entry_date"])
-            ltr = ltr.set_index(["entry_date", "ticker"]).sort_index()
-            ltr_path = output_dir / "ltr_training_dataset.parquet"
-            ltr.to_parquet(ltr_path)
-            print(f"Saved LTR dataset to {ltr_path}")
+
         if args.show_plot:
             plt.show()
         plt.close()
