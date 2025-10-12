@@ -620,9 +620,9 @@ def main() -> None:
             mom_components: List[pd.Series] = []
 
             if args.momentum_type == "classic":
-                classic_score = beta * sharpe
-                mom_components.append(classic_score)
+                classic_score = metrics["beta"] * metrics["sharpe"]
                 metrics["classic_mom"] = classic_score
+                mom_components.append(metrics["classic_mom"])
             else:
                 ewm_features = _compute_ewm_momentum(close_series, args.ewm_half_lives)
                 for column in ewm_features.columns:
