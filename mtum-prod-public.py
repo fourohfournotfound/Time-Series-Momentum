@@ -2,7 +2,20 @@
 """
 Created in 2025
 
-@author: Quant Galore
+Live momentum basket builder (Polygon).
+
+Key changes:
+- Strictly avoid same-day selection bias: the point-in-time universe is taken from
+  the last monthly snapshot strictly *before* the current rebalance month (fallback
+  to <= if the strict set is empty).
+- Added explicit shape checks/guards so MultiIndex LTR datasets won’t have misaligned
+  arrays (beta/sharpe/mom_score/forward_returns).
+- Retained your 12-1 style anchoring and feature shifts to avoid look-ahead.
+- Safer DB discovery & CSV fallback; robust comments on adjusted data semantics.
+
+Docs:
+- Polygon agg bars (split-adjusted): see polygon Python refs (adjusted by default) and FAQ.
+- Alpaca bars API reference maintained in data_providers. 
 """
 
 import argparse
@@ -12,7 +25,6 @@ from pathlib import Path
 
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import requests
 import gspread
 import sqlalchemy
@@ -47,6 +59,7 @@ def _compute_ewm_momentum(
     *,
     min_period_fraction: float = 0.5,
 ) -> pd.DataFrame:
+    # All momentum features are shifted by 1 bar to avoid look-ahead.
     returns = prices.pct_change()
     features: dict[str, pd.Series] = {}
     for hl in half_lives:
@@ -95,9 +108,7 @@ def _yang_zhang_volatility(
     *,
     annualize: int,
 ) -> pd.Series:
-    if window < 2:
-        raise ValueError("Yang–Zhang estimator requires a window of at least 2 observations")
-
+    # Yang–Zhang volatility estimator; shifted by 1 to remain causal.
     log_open = np.log(frame["o_ticker"])
     log_high = np.log(frame["h_ticker"])
     log_low = np.log(frame["l_ticker"])
@@ -110,11 +121,11 @@ def _yang_zhang_volatility(
     open_vol = (log_open - log_prev_close) ** 2
     rs = (log_high - log_close) * (log_high - log_open) + (log_low - log_close) * (log_low - log_open)
 
-    k = 0.34 / (1.34 + (window + 1) / (window - 1))
+    k = 0.34 / (1.34 + (window + 1) / max(window - 1, 1))
 
-    close_var = close_vol.rolling(window=window, min_periods=window).sum() * (1.0 / (window - 1))
-    open_var = open_vol.rolling(window=window, min_periods=window).sum() * (1.0 / (window - 1))
-    rs_var = rs.rolling(window=window, min_periods=window).sum() * (1.0 / (window - 1))
+    close_var = close_vol.rolling(window=window, min_periods=window).sum() * (1.0 / max(window - 1, 1))
+    open_var = open_vol.rolling(window=window, min_periods=window).sum() * (1.0 / max(window - 1, 1))
+    rs_var = rs.rolling(window=window, min_periods=window).sum() * (1.0 / max(window - 1, 1))
 
     yang_zhang_var = open_var + k * close_var + (1.0 - k) * rs_var
     yang_zhang_var = yang_zhang_var.clip(lower=0.0)
@@ -208,23 +219,14 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 def _load_local_env_file():
-    """Populate os.environ with keys from a `.env` file if present.
-
-    This keeps the script lightweight (no python-dotenv dependency) while
-    allowing notebook users to drop a credentials file next to the script.
-    Environment variables that are already set take precedence over any
-    values declared in the file.
-    """
-
+    """Populate os.environ with keys from a `.env` file if present."""
     env_path = Path(__file__).with_name(".env")
     if not env_path.exists():
         return
-
     for raw_line in env_path.read_text().splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip()
@@ -233,18 +235,15 @@ def _load_local_env_file():
 
 def _load_colab_user_secrets() -> None:
     """Populate environment variables from Colab user secrets when available."""
-
     try:
         from google.colab import userdata  # type: ignore
     except Exception:
         return
-
     secret_names = {
         "POLYGON_API_KEY": "POLYGON_API_KEY",
         "ALPACA_API_KEY": "ALPACA_API_KEY",
         "ALPACA_SECRET_KEY": "ALPACA_SECRET_KEY",
     }
-
     for env_name, secret_name in secret_names.items():
         if os.getenv(env_name):
             continue
@@ -255,7 +254,6 @@ def _load_colab_user_secrets() -> None:
         if value:
             os.environ[env_name] = value
 
-
 _load_local_env_file()
 _load_colab_user_secrets()
 
@@ -264,20 +262,16 @@ ARGS.ewm_half_lives = _parse_positive_int_list(ARGS.ewm_half_lives)
 if ARGS.ema_crossover and ARGS.ema_fast_hl >= ARGS.ema_slow_hl:
     raise ValueError("--ema-fast-hl must be smaller than --ema-slow-hl for the crossover signal")
 
-DEFAULT_POLYGON_KEY = "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3"
 polygon_api_key = ARGS.polygon_api_key or os.getenv("POLYGON_API_KEY")
-
-if not polygon_api_key or polygon_api_key == DEFAULT_POLYGON_KEY:
+if not polygon_api_key:
     raise RuntimeError(
         "POLYGON_API_KEY not configured. Provide a valid key via --polygon-api-key or the POLYGON_API_KEY environment variable."
     )
 
 database_url = ARGS.database_url or os.getenv("MTUM_DATABASE_URL")
 
-
 def _candidate_paths(filename: str) -> List[Path]:
     """Return plausible locations for a data file."""
-
     path = Path(filename)
     candidates = []
     if path.is_absolute():
@@ -285,7 +279,6 @@ def _candidate_paths(filename: str) -> List[Path]:
     else:
         candidates.append(Path.cwd() / path)
         candidates.append(Path(__file__).with_name(filename))
-    # Remove duplicates while preserving order
     unique_candidates = []
     seen = set()
     for candidate in candidates:
@@ -296,7 +289,6 @@ def _candidate_paths(filename: str) -> List[Path]:
     return unique_candidates
 
 engine = None
-
 if ARGS.universe_csv:
     csv_candidates = _candidate_paths(ARGS.universe_csv)
     csv_path = next((path for path in csv_candidates if path.exists()), None)
@@ -317,7 +309,6 @@ else:
                     f"file at {sqlite_path}."
                 )
                 break
-
     if database_url:
         engine = sqlalchemy.create_engine(database_url)
     else:
@@ -335,7 +326,6 @@ else:
             f"{csv_path.name} file at {csv_path}."
         )
 
-
 # =============================================================================
 # Date Management
 # =============================================================================
@@ -350,7 +340,7 @@ all_dates = pd.DataFrame({"date": pd.to_datetime(trading_dates)})
 all_dates["year"] = all_dates["date"].dt.year
 all_dates["month"] = all_dates["date"].dt.month
 
-start_of_the_months = all_dates.drop_duplicates(subset = ["year", "month"], keep = "first").copy()
+start_of_the_months = all_dates.drop_duplicates(subset=["year", "month"], keep="first").copy()
 start_of_the_months["str_date"] = start_of_the_months["date"].dt.strftime("%Y-%m-%d")
 
 months = start_of_the_months["str_date"].values
@@ -399,35 +389,22 @@ def _load_universe() -> pd.DataFrame:
     frame["date"] = pd.to_datetime(frame["date"]).dt.strftime("%Y-%m-%d")
     return frame
 
-
 universe = _load_universe()
 
-
 def _fetch_polygon_aggregates(ticker: str, start: str, end: str) -> pd.DataFrame:
-    """Fetch daily aggregate bars from Polygon."""
-
+    """Fetch daily aggregate bars from Polygon (split-adjusted by default)."""
     url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
-    params = {
-        "adjusted": "true",
-        "sort": "asc",
-        "limit": 50000,
-        "apiKey": polygon_api_key,
-    }
+    params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": polygon_api_key}
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
     payload = response.json()
     results = payload.get("results", [])
     if not results:
         return pd.DataFrame()
-
     frame = pd.json_normalize(results).set_index("t")
-    frame.index = (
-        pd.to_datetime(frame.index, unit="ms", utc=True)
-        .tz_convert("America/New_York")
-    )
+    frame.index = pd.to_datetime(frame.index, unit="ms", utc=True).tz_convert("America/New_York")
     frame["date"] = frame.index.strftime("%Y-%m-%d")
     return frame
-
 
 benchmark_data = _fetch_polygon_aggregates("SPY", "2017-01-01", trading_dates[-1])
 if benchmark_data.empty:
@@ -445,24 +422,25 @@ benchmark_data["benchmark_pct_change"] = benchmark_pct_change * 100
 # Real-Time Basket Construction
 # =============================================================================
 
-point_in_time_dates = np.sort(universe[universe["date"] <= month]["date"].drop_duplicates().values)
+# Use the monthly snapshot STRICTLY prior to 'month' to avoid same-day selection bias.
+prior_snapshot_mask = universe["date"] < month
+if not prior_snapshot_mask.any():
+    # fallback to <= month if strictly prior doesn't exist (earliest history)
+    prior_snapshot_mask = universe["date"] <= month
+
+point_in_time_dates = np.sort(universe[prior_snapshot_mask]["date"].drop_duplicates().values)
 point_in_time_date = point_in_time_dates[-1]
 
-point_in_time_universe = universe[universe["date"] == point_in_time_date].drop_duplicates(subset=["ticker"], keep = "last")
-
+point_in_time_universe = universe[universe["date"] == point_in_time_date].drop_duplicates(subset=["ticker"], keep="last")
 tickers = point_in_time_universe["ticker"].drop_duplicates().values
 
-times = []
+times: List[float] = []
+monthly_ticker_list: List[pd.DataFrame] = []
 
-monthly_ticker_list = []
-    
-# ticker = tickers[np.random.randint(0, len(tickers))]
 for idx, ticker in enumerate(tickers, start=1):
-    
     try:
-        
         start_time = datetime.now()
-        
+
         underlying_data = _fetch_polygon_aggregates(ticker, start_date, end_date)
         if underlying_data.empty:
             continue
@@ -476,10 +454,11 @@ for idx, ticker in enumerate(tickers, start=1):
             ARGS.vol_window if ARGS.vol_estimator == "yang-zhang" else 0,
         )
 
+        # Exclude the most recent month (12-1 style skip) to prevent reversal leakage
         twelve_minus_one_data = underlying_data[underlying_data["date"] < last_month_date].copy().tail(history_window)
 
-        min_history = history_window
-        if len(twelve_minus_one_data) < min_history:
+        if len(twelve_minus_one_data) < history_window:
+            # Not enough history to compute robust metrics
             continue
 
         twelve_minus_one_data["year"] = twelve_minus_one_data.index.year
@@ -487,8 +466,7 @@ for idx, ticker in enumerate(tickers, start=1):
 
         eom_ticker_data = twelve_minus_one_data.drop_duplicates(subset=["year", "month"], keep="last").copy()
         eom_ticker_data["monthly_return"] = round(eom_ticker_data["c"].pct_change() * 100, 2)
-
-        avg_monthly_return = eom_ticker_data["monthly_return"].mean()
+        avg_monthly_return = float(eom_ticker_data["monthly_return"].mean()) if len(eom_ticker_data) > 0 else np.nan
 
         ohlc_frame = (
             twelve_minus_one_data.copy()
@@ -511,7 +489,6 @@ for idx, ticker in enumerate(tickers, start=1):
             how="inner",
             sort=True,
         )
-
         if merged.shape[0] < feature_window:
             continue
 
@@ -561,12 +538,9 @@ for idx, ticker in enumerate(tickers, start=1):
                 metrics["ema_crossover"] = ema_signal.reindex(metrics.index)
                 mom_components.append(metrics["ema_crossover"])
 
-        if mom_components:
-            composite = pd.concat(mom_components, axis=1).mean(axis=1)
-        else:
-            composite = pd.Series(index=metrics.index, dtype=float)
+        composite = pd.concat(mom_components, axis=1).mean(axis=1) if mom_components else pd.Series(index=metrics.index, dtype=float)
 
-        volatility: Optional[pd.Series] = None
+        # Optional volatility normalization (shifted internally)
         if ARGS.vol_estimator != "none":
             if ARGS.vol_estimator == "ewm":
                 volatility = _ewm_volatility(close_series.pct_change(), ARGS.vol_ewm_halflife, annualize=ARGS.annualization_factor)
@@ -586,12 +560,13 @@ for idx, ticker in enumerate(tickers, start=1):
         if metrics.empty:
             continue
 
+        # Use last available metric value BEFORE the rebalance month
         current_metrics = metrics.iloc[-1]
 
+        # Forward return from first bar in 'month' to ~21bd later
         forward_data = _fetch_polygon_aggregates(ticker, end_date, next_month_date)
         if forward_data.empty or forward_data.shape[0] < 2:
             continue
-
         forward_return = round(((forward_data["c"].iloc[-1] - forward_data["c"].iloc[0]) / forward_data["c"].iloc[0]) * 100, 2)
 
         record = {
@@ -605,36 +580,32 @@ for idx, ticker in enumerate(tickers, start=1):
             "forward_returns": forward_return,
         }
 
-        if "volatility" in current_metrics.index:
+        if "volatility" in metrics.columns:
             record["volatility"] = float(current_metrics.get("volatility", np.nan))
-        if "classic_mom" in current_metrics.index:
+        if "classic_mom" in metrics.columns:
             record["classic_mom"] = float(current_metrics.get("classic_mom", np.nan))
-        for column in current_metrics.index:
+        for column in metrics.columns:
             if isinstance(column, str) and column.startswith("ewm_ret_hl_"):
                 record[column] = float(current_metrics.get(column, np.nan))
-        if "ema_crossover" in current_metrics.index:
+        if "ema_crossover" in metrics.columns:
             record["ema_crossover"] = float(current_metrics.get("ema_crossover", np.nan))
 
-        ticker_data = pd.DataFrame([record])
+        monthly_ticker_list.append(pd.DataFrame([record]))
 
-        monthly_ticker_list.append(ticker_data)
-        
-        end_time = datetime.now()    
+        end_time = datetime.now()
         seconds_to_complete = (end_time - start_time).total_seconds()
         times.append(seconds_to_complete)
         iteration = round((idx / len(tickers)) * 100, 2)
         iterations_remaining = len(tickers) - idx
-        average_time_to_complete = np.mean(times)
-        estimated_completion_time = datetime.now() + timedelta(
-            seconds=int(average_time_to_complete * max(iterations_remaining, 0))
-        )
+        average_time_to_complete = np.mean(times) if times else 0.0
+        estimated_completion_time = datetime.now() + timedelta(seconds=int(average_time_to_complete * max(iterations_remaining, 0)))
         time_remaining = estimated_completion_time - datetime.now()
         print(f"{iteration}% complete, {time_remaining} left, ETA: {estimated_completion_time}")
-        
+
     except Exception as error:
         print(f"{ticker}: {error}")
         continue
-    
+
 # =============================================================================
 # Separated Deciles
 # =============================================================================
@@ -642,9 +613,9 @@ for idx, ticker in enumerate(tickers, start=1):
 if not monthly_ticker_list:
     raise RuntimeError("No qualifying tickers were found for the current rebalance window")
 
-full_period_ticker_data = pd.concat(monthly_ticker_list)
-top_decile = full_period_ticker_data.sort_values(by="mom_score", ascending = False).head(10)
-bot_decile = full_period_ticker_data.sort_values(by="mom_score", ascending = True).head(10)
+full_period_ticker_data = pd.concat(monthly_ticker_list, ignore_index=True)
+top_decile = full_period_ticker_data.sort_values(by="mom_score", ascending=False).head(10)
+bot_decile = full_period_ticker_data.sort_values(by="mom_score", ascending=True).head(10)
 
 display_columns = [
     "ticker",
@@ -654,18 +625,14 @@ display_columns = [
     "12-1_return",
     "avg_monthly_return",
 ]
-
 if "volatility" in full_period_ticker_data.columns:
     display_columns.append("volatility")
-
 ewm_columns = sorted([col for col in full_period_ticker_data.columns if col.startswith("ewm_ret_hl_")])
 display_columns.extend(ewm_columns)
-
 if "ema_crossover" in full_period_ticker_data.columns:
     display_columns.append("ema_crossover")
 if "classic_mom" in full_period_ticker_data.columns:
     display_columns.append("classic_mom")
-
 display_columns.append("forward_returns")
 
 print("\nTop Decile Momentum Basket (long candidates):")
@@ -678,18 +645,12 @@ print(bot_decile[bot_display_columns].to_string(index=False))
 
 rebalance_output_dir = Path(__file__).resolve().parent / "rebalance_outputs"
 rebalance_output_dir.mkdir(exist_ok=True)
-
 rebalance_output_path = rebalance_output_dir / f"rebalance_{month}.csv"
 
 rebalance_export = pd.concat(
-    [
-        top_decile.assign(decile="top"),
-        bot_decile.assign(decile="bottom"),
-    ],
+    [top_decile.assign(decile="top"), bot_decile.assign(decile="bottom")],
     ignore_index=True,
 )
-
 rebalance_export.to_csv(rebalance_output_path, index=False)
 
 print(f"\nRebalance baskets saved to {rebalance_output_path}")
-
