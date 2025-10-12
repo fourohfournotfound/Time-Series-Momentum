@@ -144,6 +144,49 @@ def _vol_overlay_leverage(
     return leverage.clip(upper=cap)
 
 
+def compute_performance_metrics(returns: pd.Series, *, periods_per_year: float) -> Dict[str, float]:
+    """Compute common performance statistics for a return series."""
+    cleaned = returns.dropna()
+    if cleaned.empty:
+        return {
+            "cumulative_return": float("nan"),
+            "annualized_return": float("nan"),
+            "sortino_ratio": float("nan"),
+            "omega_ratio": float("nan"),
+            "max_drawdown": float("nan"),
+        }
+
+    cumulative = (1.0 + cleaned).prod() - 1.0
+    periods = len(cleaned)
+    annualized = (1.0 + cleaned).prod() ** (periods_per_year / periods) - 1.0 if periods else float("nan")
+
+    downside = np.minimum(cleaned, 0.0)
+    downside_std = math.sqrt(np.mean(np.square(downside))) if len(downside) else 0.0
+    sortino = float("nan")
+    if downside_std > 0:
+        sortino = cleaned.mean() / downside_std * math.sqrt(periods_per_year)
+
+    gains = np.where(cleaned > 0.0, cleaned, 0.0)
+    losses = np.where(cleaned < 0.0, -cleaned, 0.0)
+    omega = float("nan")
+    loss_sum = losses.sum()
+    if loss_sum > 0:
+        omega = gains.sum() / loss_sum
+
+    nav = (1.0 + cleaned).cumprod()
+    running_max = nav.cummax()
+    drawdowns = nav.divide(running_max) - 1.0
+    max_drawdown = drawdowns.min()
+
+    return {
+        "cumulative_return": cumulative,
+        "annualized_return": annualized,
+        "sortino_ratio": sortino,
+        "omega_ratio": omega,
+        "max_drawdown": max_drawdown,
+    }
+
+
 def _load_colab_user_secrets() -> None:
     """Populate environment variables from Colab user secrets when available."""
     try:
@@ -187,8 +230,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="backtest-output", help="Directory where reports and plots are written")
     parser.add_argument("--no-show-plot", dest="show_plot", action="store_false", help="Skip displaying the performance figure (still saved)")
     parser.set_defaults(show_plot=True)
-    parser.add_argument("--database-url", default="mysql+mysqlconnector://user:pass@localhost:3306/my_database",
-                        help="SQLAlchemy URL for the universe database")
+    parser.add_argument(
+        "--database-url",
+        default="sqlite:///universe.db",
+        help="SQLAlchemy URL for the universe database (defaults to local SQLite)",
+    )
     parser.add_argument("--universe-table", default="historical_liquid_tickers_polygon",
                         help="Table containing the point-in-time universe")
     parser.add_argument("--universe-csv", default=None, help="CSV file containing the point-in-time universe (overrides DB)")
@@ -245,8 +291,15 @@ def load_universe(args: argparse.Namespace) -> pd.DataFrame:
             raise FileNotFoundError(f"Universe CSV {csv_path} does not exist")
         universe = pd.read_csv(csv_path)
     else:
-        engine = sqlalchemy.create_engine(args.database_url)
-        universe = pd.read_sql(args.universe_table, con=engine)
+        try:
+            engine = sqlalchemy.create_engine(args.database_url)
+            with engine.connect() as connection:
+                universe = pd.read_sql(args.universe_table, con=connection)
+        except sqlalchemy.exc.SQLAlchemyError as exc:
+            raise RuntimeError(
+                "Failed to load universe from the database. "
+                "Pass --database-url/--universe-table or provide --universe-csv."
+            ) from exc
 
     if not isinstance(universe, pd.DataFrame):
         raise TypeError("Universe data must be a pandas DataFrame")
@@ -790,10 +843,18 @@ def main() -> None:
             short_uni = bot_decile_dataset[bot_decile_dataset["entry_date"] == covered_date]
             if long_uni.empty or short_uni.empty:
                 continue
+            long_mean = long_uni["forward_returns"].mean()
+            short_mean = short_uni["forward_returns"].mean()
+            if pd.isna(long_mean) or pd.isna(short_mean):
+                continue
             trade = pd.DataFrame(
-                [{"date": covered_date,
-                  "long": long_uni["forward_returns"].mean(),
-                  "short": short_uni["forward_returns"].mean() * -1}]
+                [
+                    {
+                        "date": covered_date,
+                        "long_return": long_mean / 100.0,
+                        "short_return": -short_mean / 100.0,
+                    }
+                ]
             )
             trades.append(trade)
 
@@ -835,8 +896,8 @@ def main() -> None:
         turnover_frame["long_turnover"] = long_turnover.reindex(turnover_frame.index).fillna(1.0)
         turnover_frame["short_turnover"] = short_turnover.reindex(turnover_frame.index).fillna(1.0)
 
-        long_returns = (all_trades["long"].to_numpy() / 100.0) * GROSS_LONG
-        short_returns = (all_trades["short"].to_numpy() / 100.0) * GROSS_SHORT
+        long_returns = all_trades["long_return"].to_numpy() * GROSS_LONG
+        short_returns = all_trades["short_return"].to_numpy() * GROSS_SHORT
         ls_returns = long_returns + short_returns
 
         cost_decimals = (
@@ -868,12 +929,59 @@ def main() -> None:
         if overlay_returns is not None:
             all_trades["ls_nav_vol_managed"] = np.cumprod(1.0 + overlay_returns)
 
+        all_trades["ls_return"] = ls_returns
+        all_trades["ls_return_net"] = ls_returns_net
+        if overlay_returns is not None:
+            all_trades["ls_return_vol_managed"] = overlay_returns
+
+        all_trades["long_pct"] = all_trades["long_return"] * 100.0
+        all_trades["short_pct"] = all_trades["short_return"] * 100.0
+        all_trades["ls_pct"] = all_trades["ls_return"] * 100.0
+        all_trades["ls_pct_net"] = all_trades["ls_return_net"] * 100.0
+        if overlay_returns is not None:
+            all_trades["ls_pct_vol_managed"] = all_trades["ls_return_vol_managed"] * 100.0
+
+        # Backwards-compatible column names for exported CSV (percentage values)
+        all_trades["long"] = all_trades["long_pct"]
+        all_trades["short"] = all_trades["short_pct"]
+
         all_trades["long_cum_%"] = (all_trades["long_nav"] - 1.0) * 100.0
         all_trades["short_cum_%"] = (all_trades["short_nav"] - 1.0) * 100.0
         all_trades["ls_cum_%"] = (all_trades["ls_nav"] - 1.0) * 100.0
         all_trades["ls_cum_%_net"] = (all_trades["ls_nav_net"] - 1.0) * 100.0
         if overlay_returns is not None:
             all_trades["ls_cum_%_vol_managed"] = (all_trades["ls_nav_vol_managed"] - 1.0) * 100.0
+
+        # Performance diagnostics
+        periods_per_year_float = float(args.annualization_factor) / max(SKIP_BDAYS, 1)
+        ls_net_series = pd.Series(ls_returns_net, index=trades_dates, dtype=float)
+        metrics_records = []
+
+        def _format_metric(name: str, value: float) -> str:
+            if pd.isna(value):
+                return "n/a"
+            if "ratio" in name:
+                return f"{value:.4f}"
+            return f"{value:.2%}"
+
+        net_metrics = compute_performance_metrics(ls_net_series, periods_per_year=periods_per_year_float)
+        metrics_records.append({"series": "long_short_net", **net_metrics})
+        print("\nPerformance metrics (long-short, net of costs):")
+        for metric_name, metric_value in net_metrics.items():
+            print(f"  {metric_name.replace('_', ' ').title()}: {_format_metric(metric_name, metric_value)}")
+
+        if overlay_returns is not None:
+            overlay_series = pd.Series(overlay_returns, index=trades_dates, dtype=float)
+            overlay_metrics = compute_performance_metrics(
+                overlay_series, periods_per_year=periods_per_year_float
+            )
+            metrics_records.append({"series": "long_short_vol_managed", **overlay_metrics})
+            print("\nPerformance metrics (long-short with volatility overlay):")
+            for metric_name, metric_value in overlay_metrics.items():
+                print(f"  {metric_name.replace('_', ' ').title()}: {_format_metric(metric_name, metric_value)}")
+
+        metrics_path = output_dir / "performance_metrics.csv"
+        pd.DataFrame(metrics_records).to_csv(metrics_path, index=False)
 
         plt.figure(figsize=(10, 6), dpi=200)
         plt.xticks(rotation=45)
