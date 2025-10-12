@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,6 +20,142 @@ from pandas.tseries.offsets import BDay
 from pandas_market_calendars import get_calendar
 
 from data_providers import AlpacaBarsClient, PolygonAggsClient
+
+
+def _parse_positive_int_list(raw: str, *, min_value: int = 1) -> List[int]:
+    """Parse a comma-separated list of positive integers."""
+
+    values: List[int] = []
+    for chunk in raw.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        value = int(item)
+        if value < min_value:
+            raise argparse.ArgumentTypeError(
+                f"All integers must be >= {min_value}; received {value} in '{raw}'"
+            )
+        values.append(value)
+    if not values:
+        raise argparse.ArgumentTypeError("At least one integer value is required")
+    return values
+
+
+def _compute_ewm_momentum(
+    prices: pd.Series,
+    half_lives: Iterable[int],
+    *,
+    min_period_fraction: float = 0.5,
+) -> pd.DataFrame:
+    """Return exponentially weighted momentum features for ``prices``.
+
+    The output columns are named ``ewm_ret_hl_{half_life}`` and are shifted by one
+    period to preserve causality.
+    """
+
+    returns = prices.pct_change()
+    features: Dict[str, pd.Series] = {}
+    for hl in half_lives:
+        min_periods = max(int(math.ceil(hl * min_period_fraction)), 1)
+        ewm_mean = returns.ewm(halflife=hl, adjust=False, min_periods=min_periods).mean()
+        features[f"ewm_ret_hl_{hl}"] = ewm_mean.shift(1)
+    return pd.DataFrame(features)
+
+
+def _ema_crossover_signal(
+    prices: pd.Series,
+    fast_hl: int,
+    slow_hl: int,
+    *,
+    min_period_fraction: float = 0.5,
+) -> pd.Series:
+    """Difference between fast and slow exponential moving averages (lagged)."""
+
+    if fast_hl >= slow_hl:
+        raise ValueError("fast_hl must be strictly less than slow_hl")
+
+    fast_min_periods = max(int(math.ceil(fast_hl * min_period_fraction)), 1)
+    slow_min_periods = max(int(math.ceil(slow_hl * min_period_fraction)), 1)
+
+    fast_ma = prices.ewm(halflife=fast_hl, adjust=False, min_periods=fast_min_periods).mean()
+    slow_ma = prices.ewm(halflife=slow_hl, adjust=False, min_periods=slow_min_periods).mean()
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        crossover = fast_ma.divide(slow_ma) - 1.0
+    crossover = crossover.replace([np.inf, -np.inf], np.nan)
+    return crossover.shift(1)
+
+
+def _ewm_volatility(
+    returns: pd.Series,
+    half_life: int,
+    *,
+    annualize: int,
+    min_period_fraction: float = 0.5,
+) -> pd.Series:
+    """Exponentially weighted volatility estimate (annualised)."""
+
+    min_periods = max(int(math.ceil(half_life * min_period_fraction)), 1)
+    ewm_std = returns.ewm(halflife=half_life, adjust=False, min_periods=min_periods).std()
+    return ewm_std.shift(1) * math.sqrt(annualize)
+
+
+def _yang_zhang_volatility(
+    frame: pd.DataFrame,
+    window: int,
+    *,
+    annualize: int,
+) -> pd.Series:
+    """Compute Yang–Zhang volatility using OHLC data and annualise it."""
+
+    if window < 2:
+        raise ValueError("Yang–Zhang estimator requires a window of at least 2 observations")
+
+    log_open = np.log(frame["o_ticker"])
+    log_high = np.log(frame["h_ticker"])
+    log_low = np.log(frame["l_ticker"])
+    log_close = np.log(frame["c_ticker"])
+
+    log_prev_close = log_close.shift(1)
+    log_prev_open = log_open.shift(1)
+
+    close_vol = (log_close - log_prev_close) ** 2
+    open_vol = (log_open - log_prev_close) ** 2
+    rs = (log_high - log_close) * (log_high - log_open) + (log_low - log_close) * (log_low - log_open)
+
+    k = 0.34 / (1.34 + (window + 1) / (window - 1))
+
+    close_var = close_vol.rolling(window=window, min_periods=window).sum() * (1.0 / (window - 1))
+    open_var = open_vol.rolling(window=window, min_periods=window).sum() * (1.0 / (window - 1))
+    rs_var = rs.rolling(window=window, min_periods=window).sum() * (1.0 / (window - 1))
+
+    yang_zhang_var = open_var + k * close_var + (1.0 - k) * rs_var
+    yang_zhang_var = yang_zhang_var.clip(lower=0.0)
+    return np.sqrt(yang_zhang_var).shift(1) * math.sqrt(annualize)
+
+
+def _vol_overlay_leverage(
+    returns: pd.Series,
+    *,
+    halflife: int,
+    target_vol: float,
+    cap: float,
+    periods_per_year: int,
+) -> pd.Series:
+    """Compute volatility-managed leverage series for portfolio returns."""
+
+    if halflife <= 0:
+        raise ValueError("halflife must be positive for the volatility overlay")
+
+    min_periods = max(int(math.ceil(halflife * 0.5)), 1)
+    ewm_std = returns.ewm(halflife=halflife, adjust=False, min_periods=min_periods).std()
+    annualised = ewm_std.shift(1) * math.sqrt(periods_per_year)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        leverage = target_vol / annualised
+    leverage = leverage.clip(lower=0.0)
+    leverage = leverage.replace([np.inf, -np.inf], np.nan)
+    leverage = leverage.fillna(0.0)
+    return leverage.clip(upper=cap)
 
 
 def _load_colab_user_secrets() -> None:
@@ -87,6 +224,81 @@ def parse_args() -> argparse.Namespace:
         "--universe-csv",
         default=None,
         help="CSV file containing the point-in-time universe (overrides the database)",
+    )
+    parser.add_argument(
+        "--annualization-factor",
+        type=int,
+        default=252,
+        help="Trading periods used for annualising volatility estimates",
+    )
+    parser.add_argument(
+        "--momentum-type",
+        choices=["classic", "ewm"],
+        default="classic",
+        help="Momentum definition: classic beta*Sharpe or EWMA-based",
+    )
+    parser.add_argument(
+        "--ewm-half-lives",
+        default="63,126,252",
+        help="Comma-separated half-lives (in days) for EWMA momentum",
+    )
+    parser.add_argument(
+        "--ema-crossover",
+        action="store_true",
+        help="Augment EWMA momentum with an EMA crossover signal",
+    )
+    parser.add_argument(
+        "--ema-fast-hl",
+        type=int,
+        default=32,
+        help="Half-life for the fast EMA when --ema-crossover is enabled",
+    )
+    parser.add_argument(
+        "--ema-slow-hl",
+        type=int,
+        default=128,
+        help="Half-life for the slow EMA when --ema-crossover is enabled",
+    )
+    parser.add_argument(
+        "--vol-estimator",
+        choices=["none", "ewm", "yang-zhang"],
+        default="none",
+        help="Volatility estimator to use for risk-adjusting momentum",
+    )
+    parser.add_argument(
+        "--vol-ewm-halflife",
+        type=int,
+        default=20,
+        help="Half-life for the EWM volatility estimator",
+    )
+    parser.add_argument(
+        "--vol-window",
+        type=int,
+        default=20,
+        help="Window length for the Yang–Zhang volatility estimator",
+    )
+    parser.add_argument(
+        "--vol-overlay",
+        action="store_true",
+        help="Apply a volatility-managed overlay to the long-short returns",
+    )
+    parser.add_argument(
+        "--vol-overlay-halflife",
+        type=int,
+        default=63,
+        help="Half-life (in rebalances) for the overlay volatility estimate",
+    )
+    parser.add_argument(
+        "--vol-overlay-target",
+        type=float,
+        default=0.10,
+        help="Annualised volatility target for the overlay",
+    )
+    parser.add_argument(
+        "--vol-overlay-cap",
+        type=float,
+        default=5.0,
+        help="Maximum leverage multiple applied by the overlay",
     )
     return parser.parse_args()
 
@@ -196,6 +408,11 @@ def fetch_benchmark(
 
 def main() -> None:
     args = parse_args()
+    args.ewm_half_lives = _parse_positive_int_list(args.ewm_half_lives)
+    if args.ema_crossover and args.ema_fast_hl >= args.ema_slow_hl:
+        raise ValueError("--ema-fast-hl must be smaller than --ema-slow-hl for the crossover signal")
+    if args.vol_overlay and args.vol_overlay_target <= 0:
+        raise ValueError("--vol-overlay-target must be positive")
     provider = build_provider(args)
     try:
         cache_dir = Path(args.cache_dir)
@@ -339,8 +556,23 @@ def main() -> None:
             history = history.sort_values("timestamp").drop_duplicates(subset="date", keep="last")
             history["date"] = pd.to_datetime(history["date"])
 
+            history_columns = ["date", "o", "h", "l", "c"]
+            missing_cols = sorted(set(history_columns) - set(history.columns))
+            if missing_cols:
+                raise ValueError(f"History for {ticker} is missing required columns: {missing_cols}")
+
+            close_series = history.set_index("date")["c"].sort_index()
+            ohlc_frame = history.set_index("date")[["o", "h", "l", "c"]].sort_index()
+
             merged = pd.merge(
-                history[["date", "c"]].rename(columns={"c": "c_ticker"}),
+                ohlc_frame.reset_index().rename(
+                    columns={
+                        "o": "o_ticker",
+                        "h": "h_ticker",
+                        "l": "l_ticker",
+                        "c": "c_ticker",
+                    }
+                ),
                 benchmark_data[["date", "c", "benchmark_pct_change"]].rename(
                     columns={"c": "c_benchmark"}
                 ),
@@ -353,10 +585,10 @@ def main() -> None:
                 continue
 
             merged = merged.sort_values("date").reset_index(drop=True)
-            ticker_pct_change = merged["c_ticker"].pct_change()
-            if not ticker_pct_change.empty:
-                ticker_pct_change.iloc[0] = 0.0
-            merged["ticker_pct_change"] = ticker_pct_change * 100
+            ticker_returns = merged["c_ticker"].pct_change()
+            if not ticker_returns.empty:
+                ticker_returns.iloc[0] = 0.0
+            merged["ticker_pct_change"] = ticker_returns * 100
 
             rolling_cov = merged["ticker_pct_change"].rolling(window=feature_window, min_periods=feature_window).cov(
                 merged["benchmark_pct_change"]
@@ -366,12 +598,10 @@ def main() -> None:
 
             total_return = merged["c_ticker"].pct_change(periods=feature_window - 1) * 100
             rolling_std = merged["ticker_pct_change"].rolling(window=feature_window, min_periods=feature_window).std()
-            rolling_std = rolling_std * np.sqrt(252)
+            rolling_std = rolling_std * np.sqrt(args.annualization_factor)
             rolling_std = rolling_std.replace(0, np.nan)
             sharpe = total_return.divide(rolling_std)
             sharpe = sharpe.replace([np.inf, -np.inf], np.nan)
-
-            mom_score = beta * sharpe
 
             metrics = (
                 pd.DataFrame(
@@ -380,12 +610,72 @@ def main() -> None:
                         "beta": beta,
                         "sharpe": sharpe,
                         "12-1_return": total_return,
-                        "mom_score": mom_score,
                     }
                 )
                 .set_index("date")
                 .sort_index()
             )
+
+            # Momentum features -------------------------------------------------
+            mom_components: List[pd.Series] = []
+
+            if args.momentum_type == "classic":
+                classic_score = beta * sharpe
+                mom_components.append(classic_score)
+                metrics["classic_mom"] = classic_score
+            else:
+                ewm_features = _compute_ewm_momentum(close_series, args.ewm_half_lives)
+                for column in ewm_features.columns:
+                    metrics[column] = ewm_features[column].reindex(metrics.index)
+                    mom_components.append(metrics[column])
+                if args.ema_crossover:
+                    ema_signal = _ema_crossover_signal(
+                        close_series,
+                        args.ema_fast_hl,
+                        args.ema_slow_hl,
+                    )
+                    metrics["ema_crossover"] = ema_signal.reindex(metrics.index)
+                    mom_components.append(metrics["ema_crossover"])
+
+            if mom_components:
+                mom_matrix = pd.concat(mom_components, axis=1)
+                composite = mom_matrix.mean(axis=1)
+            else:
+                composite = pd.Series(index=metrics.index, dtype=float)
+
+            # Volatility estimates ---------------------------------------------
+            volatility: Optional[pd.Series] = None
+            if args.vol_estimator != "none":
+                try:
+                    if args.vol_estimator == "ewm":
+                        volatility = _ewm_volatility(
+                            close_series.pct_change(),
+                            args.vol_ewm_halflife,
+                            annualize=args.annualization_factor,
+                        )
+                    else:
+                        volatility = _yang_zhang_volatility(
+                            ohlc_frame.rename(
+                                columns={
+                                    "o": "o_ticker",
+                                    "h": "h_ticker",
+                                    "l": "l_ticker",
+                                    "c": "c_ticker",
+                                }
+                            ),
+                            args.vol_window,
+                            annualize=args.annualization_factor,
+                        )
+                except Exception as vol_err:
+                    raise RuntimeError(f"Failed to compute volatility for {ticker}: {vol_err}") from vol_err
+
+            if volatility is not None:
+                metrics["volatility"] = volatility.reindex(metrics.index)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    composite = composite.divide(metrics["volatility"])
+                composite = composite.replace([np.inf, -np.inf], np.nan)
+
+            metrics["mom_score"] = composite
 
             metrics = metrics.reindex(feature_anchor_index, method="ffill")
 
@@ -433,6 +723,16 @@ def main() -> None:
                     "forward_returns": forward_returns,
                 }
             )
+
+            if "volatility" in metrics.columns:
+                monthly_results["volatility"] = metrics["volatility"].to_numpy()
+            if "classic_mom" in metrics.columns:
+                monthly_results["classic_mom"] = metrics["classic_mom"].to_numpy()
+            for column in metrics.columns:
+                if column.startswith("ewm_ret_hl_"):
+                    monthly_results[column] = metrics[column].to_numpy()
+            if "ema_crossover" in metrics.columns:
+                monthly_results["ema_crossover"] = metrics["ema_crossover"].to_numpy()
 
             in_universe = np.array([ticker in universe_by_month.get(month, set()) for month in analysis_months])
             monthly_results = monthly_results[in_universe]
@@ -563,14 +863,32 @@ def main() -> None:
         )
         ls_returns_net = ls_returns - cost_decimals
 
+        overlay_returns = None
+        if args.vol_overlay:
+            periods_per_year = max(int(round(args.annualization_factor / max(SKIP_BDAYS, 1))), 1)
+            leverage_series = _vol_overlay_leverage(
+                pd.Series(ls_returns, index=trades_dates, dtype=float),
+                halflife=args.vol_overlay_halflife,
+                target_vol=args.vol_overlay_target,
+                cap=args.vol_overlay_cap,
+                periods_per_year=periods_per_year,
+            ).reindex(trades_dates).fillna(0.0)
+            overlay_returns = ls_returns * leverage_series.to_numpy() - cost_decimals * leverage_series.to_numpy()
+            all_trades["vol_overlay_leverage"] = leverage_series.to_numpy()
+
         all_trades["long_nav"] = np.cumprod(1.0 + long_returns)
         all_trades["short_nav"] = np.cumprod(1.0 + short_returns)
         all_trades["ls_nav"] = np.cumprod(1.0 + ls_returns)
         all_trades["ls_nav_net"] = np.cumprod(1.0 + ls_returns_net)
+        if overlay_returns is not None:
+            all_trades["ls_nav_vol_managed"] = np.cumprod(1.0 + overlay_returns)
+
         all_trades["long_cum_%"] = (all_trades["long_nav"] - 1.0) * 100.0
         all_trades["short_cum_%"] = (all_trades["short_nav"] - 1.0) * 100.0
         all_trades["ls_cum_%"] = (all_trades["ls_nav"] - 1.0) * 100.0
         all_trades["ls_cum_%_net"] = (all_trades["ls_nav_net"] - 1.0) * 100.0
+        if overlay_returns is not None:
+            all_trades["ls_cum_%_vol_managed"] = (all_trades["ls_nav_vol_managed"] - 1.0) * 100.0
 
         plt.figure(figsize=(10, 6), dpi=200)
         plt.xticks(rotation=45)
@@ -580,6 +898,8 @@ def main() -> None:
         plt.plot(trades_dates, all_trades["short_cum_%"], label="Bottom Decile (gross)")
         plt.plot(trades_dates, all_trades["ls_cum_%"], label="Long-Short (gross)")
         plt.plot(trades_dates, all_trades["ls_cum_%_net"], label="Long-Short (net est. costs)")
+        if overlay_returns is not None:
+            plt.plot(trades_dates, all_trades["ls_cum_%_vol_managed"], label="Long-Short (vol managed)")
         plt.legend()
         plt.xlabel("Date")
         plt.ylabel("Cumulative % Return")
