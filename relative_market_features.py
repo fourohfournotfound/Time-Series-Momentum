@@ -2,29 +2,27 @@
 """
 Relative market + entropy/information-theory utilities (causal, shape-preserving).
 
-This module is designed to be imported by both the backtest and live basket
-scripts. All functions:
-
-  • preserve MultiIndex (date, ticker) ordering and row counts for additive features,
+All functions:
+  • preserve MultiIndex (date, ticker) and row count for additive features,
   • avoid look-ahead by shifting to t-1 where required,
-  • are robust to missing data and tiny cross-sections.
+  • robust to missing data / small cross-sections.
 
-Key exports:
-  - add_entropy_info_features(...): PE/SE + peer surprisal & JSD (optional PCA mix entropy).
-  - add_relative_to_market(...): simple causal market-return & shrunk beta example.
+Exports:
+  - add_entropy_info_features(...): permutation/spectral entropy (PE/SE) + peer surprisal & JSD.
+  - add_relative_to_market(...): simple causal market-return & shrunk beta.
+  - ewm_moments(...): per-ticker causal EWMA mean/vol (annualized).
+  - volatility_target_scale(...): per-ticker causal vol-target scaling factor.
+  - latest_per_ticker(...): last valid (<= cutoff) features per ticker.
 
 Notes:
-  • Permutation entropy (PE) and spectral entropy (SE) are normalized to [0,1].
-  • Cross-sectional peer metrics are computed from t-1 returns per date.
+  • PE/SE normalized to [0,1]. Peer metrics computed from r[t-1].
 """
 
 from __future__ import annotations
-from typing import Optional, Tuple, Dict, List
-
+from typing import Optional, Tuple, List
 import numpy as np
 import pandas as pd
 
-# Optional numba acceleration for inner loops; safe no-op fallback if unavailable.
 try:
     from numba import njit
 except Exception:  # pragma: no cover
@@ -33,25 +31,21 @@ except Exception:  # pragma: no cover
             return f
         return _wrap
 
-
 # ---------------------------
-# Validation / small helpers
+# Validation / helpers
 # ---------------------------
 
 def validate_relative_features(df: pd.DataFrame,
                                original_shape: Tuple[int, int],
-                               verbose: bool = True) -> None:
-    """Ensure shape and index invariants are preserved."""
+                               verbose: bool = False) -> None:
     assert isinstance(df.index, pd.MultiIndex) and list(df.index.names)[:2] == ["date", "ticker"], \
         "Index must remain MultiIndex ['date','ticker']"
     assert df.shape[0] == int(original_shape[0]), \
         f"Row count changed ({original_shape[0]} -> {df.shape[0]})"
-    if verbose:
+    if verbose:  # place for future logging
         pass
 
-
 def _ensure_returns(df: pd.DataFrame, price_col: str = "closeadj") -> pd.Series:
-    """Return (date,ticker) Series of simple returns based on preferred price column."""
     if "returns" in df.columns:
         return df["returns"]
     base = price_col
@@ -62,7 +56,6 @@ def _ensure_returns(df: pd.DataFrame, price_col: str = "closeadj") -> pd.Series:
     r = df.groupby(level="ticker")[base].pct_change()
     return r
 
-
 def _robust_minmax_series(s: pd.Series, window: int = 252, minp_ratio: float = 0.5) -> pd.Series:
     minp = max(10, int(window * minp_ratio))
     lo = s.rolling(window, min_periods=minp).min().shift(1)
@@ -71,11 +64,9 @@ def _robust_minmax_series(s: pd.Series, window: int = 252, minp_ratio: float = 0
         mm = (s - lo) / (hi - lo)
     return mm.clip(0.0, 1.0)
 
-
 def _choose_market_ec_col(cols: pd.Index) -> Optional[str]:
     ec_cols = [c for c in cols if str(c).startswith("market_EC_")]
     return ec_cols[0] if ec_cols else None
-
 
 # ---------------------------
 # Simple relative-to-market example (causal)
@@ -86,14 +77,8 @@ def add_relative_to_market(
     price_col: str = "closeadj",
     beta_window: int = 60,
     use_lagged_data: bool = True,
-    verbose: bool = True,
+    verbose: bool = False,
 ) -> pd.DataFrame:
-    """Add simple relative-to-market features; causal if use_lagged_data=True.
-
-    Produces:
-      - market_return: equal-weight cross-sectional average return per date
-      - beta_60d: shrunk rolling beta to market_return, shifted by 1 for causality
-    """
     assert isinstance(df.index, pd.MultiIndex) and df.index.names == ["date", "ticker"]
     out = df.copy()
     base_col = price_col if price_col in out.columns else ("closeadj" if "closeadj" in out.columns else None)
@@ -126,7 +111,6 @@ def add_relative_to_market(
     out["beta_60d"] = tmp.set_index(["date", "ticker"])["beta_60d"]
     return out
 
-
 # ---------------------------
 # Entropy / Information-theory features (causal)
 # ---------------------------
@@ -137,7 +121,6 @@ def _factorials_upto(n: int) -> np.ndarray:
     for i in range(2, n + 1):
         f[i] = f[i - 1] * i
     return f
-
 
 @njit(cache=True)
 def _lehmer_code_from_perm(perm: np.ndarray) -> int:
@@ -153,12 +136,10 @@ def _lehmer_code_from_perm(perm: np.ndarray) -> int:
         code += c * fact[m - 1 - i]
     return code
 
-
 @njit(cache=True)
 def _ordinal_code(values: np.ndarray) -> int:
     order = np.argsort(values)
     return _lehmer_code_from_perm(order)
-
 
 @njit(cache=True)
 def _sliding_permutation_entropy(
@@ -255,7 +236,6 @@ def _sliding_permutation_entropy(
 
     return H
 
-
 def _rolling_spectral_entropy(
     x: np.ndarray,
     window: int,
@@ -296,14 +276,12 @@ def _rolling_spectral_entropy(
         t = t_next
     return H
 
-
 def _cross_sectional_surprisal_from_bins(
     r_lag: pd.Series,
     n_bins: int = 21,
     q_low: float = 0.01,
     q_high: float = 0.99,
-) -> Tuple[pd.Series, pd.Series, np.ndarray]:
-    """Causal per-date cross-sectional surprisal at date t using r[t-1]."""
+):
     if r_lag.empty:
         return (
             pd.Series(np.nan, index=r_lag.index),
@@ -311,8 +289,7 @@ def _cross_sectional_surprisal_from_bins(
             np.array([]),
         )
     assert isinstance(r_lag.index, pd.MultiIndex) and "date" in r_lag.index.names and "ticker" in r_lag.index.names
-    surpr_parts = []
-    p_parts = []
+    surpr_parts, p_parts = [], []
     for d, s in r_lag.groupby(level="date"):
         x = s.to_numpy(dtype=float)
         x_f = x[np.isfinite(x)]
@@ -320,8 +297,7 @@ def _cross_sectional_surprisal_from_bins(
             surpr_parts.append(pd.Series(np.nan, index=s.index))
             p_parts.append(pd.Series(np.nan, index=s.index))
             continue
-        lo = float(np.quantile(x_f, q_low))
-        hi = float(np.quantile(x_f, q_high))
+        lo = float(np.quantile(x_f, q_low)); hi = float(np.quantile(x_f, q_high))
         if (not np.isfinite(lo)) or (not np.isfinite(hi)) or (lo >= hi):
             lo, hi = float(np.min(x_f)), float(np.max(x_f))
             if (not np.isfinite(lo)) or (not np.isfinite(hi)) or (lo >= hi):
@@ -329,8 +305,7 @@ def _cross_sectional_surprisal_from_bins(
                 p_parts.append(pd.Series(np.nan, index=s.index))
                 continue
         edges_d = np.linspace(lo, hi, n_bins + 1)
-        b = np.digitize(x, edges_d) - 1
-        b = np.clip(b, 0, n_bins - 1)
+        b = np.clip(np.digitize(x, edges_d) - 1, 0, n_bins - 1)
         counts = np.bincount(b, minlength=n_bins).astype(float)
         total = counts.sum()
         if total <= 0:
@@ -346,17 +321,14 @@ def _cross_sectional_surprisal_from_bins(
     p_series = pd.concat(p_parts).sort_index().rename("peer_prob")
     return surprisal, p_series, np.array([])
 
-
 def _peer_jsd_pointmass(
     r_lag: pd.Series,
     n_bins: int = 21,
     q_low: float = 0.01,
     q_high: float = 0.99,
 ) -> pd.Series:
-    """Causal Jensen–Shannon divergence between a point mass at r_i[t-1] and cross-section."""
     if r_lag.empty:
         return pd.Series(np.nan, index=r_lag.index, name=f"peer_jsd_bins{n_bins}")
-    assert isinstance(r_lag.index, pd.MultiIndex) and "date" in r_lag.index.names and "ticker" in r_lag.index.names
 
     def _H(p: np.ndarray) -> float:
         p = np.clip(p, 1e-300, 1.0)
@@ -369,21 +341,17 @@ def _peer_jsd_pointmass(
         if x_f.size < max(8, n_bins // 2):
             out_parts.append(pd.Series(np.nan, index=s.index))
             continue
-        lo = float(np.quantile(x_f, q_low))
-        hi = float(np.quantile(x_f, q_high))
+        lo = float(np.quantile(x_f, q_low)); hi = float(np.quantile(x_f, q_high))
         if (not np.isfinite(lo)) or (not np.isfinite(hi)) or (lo >= hi):
             lo, hi = float(np.min(x_f)), float(np.max(x_f))
             if (not np.isfinite(lo)) or (not np.isfinite(hi)) or (lo >= hi):
-                out_parts.append(pd.Series(np.nan, index=s.index))
-                continue
+                out_parts.append(pd.Series(np.nan, index=s.index)); continue
         edges = np.linspace(lo, hi, n_bins + 1)
-        b = np.digitize(x, edges) - 1
-        b = np.clip(b, 0, n_bins - 1)
+        b = np.clip(np.digitize(x, edges) - 1, 0, n_bins - 1)
         counts = np.bincount(b, minlength=n_bins).astype(float)
         total = counts.sum()
         if total <= 0:
-            out_parts.append(pd.Series(np.nan, index=s.index))
-            continue
+            out_parts.append(pd.Series(np.nan, index=s.index)); continue
         q = counts / total
         Hq = _H(q)
         jsd_by_bin = np.empty(n_bins, dtype=float)
@@ -396,7 +364,6 @@ def _peer_jsd_pointmass(
         out_parts.append(pd.Series(jsd_i, index=s.index, dtype=float))
     return pd.concat(out_parts).sort_index().rename(f"peer_jsd_bins{n_bins}")
 
-
 def _cs_robustz(df: pd.DataFrame, col: str, clip: float = 8.0) -> pd.Series:
     s = df[col].astype(float)
     med = s.groupby(level="date").transform("median")
@@ -407,7 +374,6 @@ def _cs_robustz(df: pd.DataFrame, col: str, clip: float = 8.0) -> pd.Series:
     z = (s - med) / (iqr / 1.349 + 1e-8)
     return z.clip(-clip, clip)
 
-
 def _pca_factor_mix_entropy(
     panel: pd.DataFrame,
     window: int = 252,
@@ -415,7 +381,6 @@ def _pca_factor_mix_entropy(
     update_freq: int = 5,
     min_valid_ratio: float = 0.6,
 ) -> pd.DataFrame:
-    """Optional ‘factor mix entropy’: diversity of top eigenvectors in trailing corr."""
     all_dates = panel.index.to_numpy()
     out_frames = []
     start = window
@@ -452,7 +417,6 @@ def _pca_factor_mix_entropy(
     Hdf = Hdf.reindex(panel.index).ffill()
     return Hdf
 
-
 def add_entropy_info_features(
     df: pd.DataFrame,
     price_col: str = "closeadj",
@@ -471,20 +435,12 @@ def add_entropy_info_features(
     pca_min_valid_ratio: float = 0.6,
     verbose: bool = False,
 ) -> pd.DataFrame:
-    """Add entropy & information-theory features to a (date,ticker) MultiIndex DataFrame.
-
-    All features are causal and shape-preserving. PE/SE are per-ticker; peer metrics
-    are optional cross-sectional features (causal at t-1). PCA-based factor-mix entropy
-    is optional and can be expensive; disabled by default (pca_window=None).
-    """
     assert isinstance(df.index, pd.MultiIndex) and df.index.names == ["date", "ticker"], \
         "Index must be MultiIndex ['date','ticker'] (sorted)."
     out = df.copy()
 
     r = _ensure_returns(out, price_col=price_col)
     r_for = r.groupby(level="ticker").shift(1) if use_lagged_data else r
-    if verbose:
-        pass
 
     # Permutation entropy per ticker
     pe_list = []
@@ -516,7 +472,7 @@ def add_entropy_info_features(
     jsd = _peer_jsd_pointmass(r_for, n_bins=cs_bins)
     out[f"peer_jsd_bins{cs_bins}"] = jsd
 
-    # Robust per-date z-scores for peer metrics
+    # Robust per-date z-scores
     out["peer_surprisal_z"] = _cs_robustz(out, f"peer_surprisal_cs_bins{cs_bins}")
     out["peer_jsd_z"] = _cs_robustz(out, f"peer_jsd_bins{cs_bins}")
 
@@ -532,11 +488,58 @@ def add_entropy_info_features(
     assert out.shape[0] == df.shape[0]
     return out
 
+# ---------------------------
+# NEW: Causal EWMA & Vol-target helpers
+# ---------------------------
+
+def ewm_moments(
+    df: pd.DataFrame,
+    ret_col: str = "returns",
+    halflife: int = 63,
+    use_lagged_data: bool = True,
+) -> pd.DataFrame:
+    """Per-ticker EWMA mean & vol (annualized) of returns at t-1 if use_lagged_data."""
+    assert isinstance(df.index, pd.MultiIndex) and df.index.names == ["date", "ticker"]
+    s = df[ret_col].astype(float)
+
+    def _per_ticker(x: pd.Series) -> pd.DataFrame:
+        m = x.ewm(halflife=halflife, adjust=False, min_periods=max(10, halflife//2)).mean()
+        v = x.ewm(halflife=halflife, adjust=False, min_periods=max(10, halflife//2)).var()
+        if use_lagged_data:
+            m = m.shift(1); v = v.shift(1)
+        out = pd.DataFrame({"ewm_mean": m, "ewm_vol_ann": np.sqrt(v) * np.sqrt(252.0)})
+        return out
+
+    out = s.groupby(level="ticker", group_keys=False).apply(_per_ticker)
+    return out
+
+def volatility_target_scale(
+    df: pd.DataFrame,
+    vol_col: str = "ewm_vol_ann",
+    target_vol: float = 0.20,
+    cap: float = 3.0,
+) -> pd.Series:
+    """Scale factor per row to hit target annualized vol; clipped to [0, cap]."""
+    v = df[vol_col].astype(float).replace(0.0, np.nan)
+    scale = target_vol / (v + 1e-8)
+    return scale.clip(lower=0.0, upper=cap).fillna(0.0)
+
+def latest_per_ticker(df: pd.DataFrame, cutoff_date: pd.Timestamp, cols: List[str]) -> pd.DataFrame:
+    """Return last available row <= cutoff_date for each ticker, with columns 'cols'."""
+    assert isinstance(df.index, pd.MultiIndex) and df.index.names == ["date", "ticker"]
+    sub = df.loc[pd.IndexSlice[:cutoff_date, :], cols].copy()
+    last_idx = sub.groupby(level="ticker").tail(1)
+    last_idx = last_idx.reset_index(level="date", drop=False)
+    last_idx = last_idx.reset_index().set_index("ticker")
+    return last_idx
 
 __all__ = [
     "validate_relative_features",
     "add_relative_to_market",
     "add_entropy_info_features",
+    "ewm_moments",
+    "volatility_target_scale",
+    "latest_per_ticker",
     "_cross_sectional_surprisal_from_bins",
     "_peer_jsd_pointmass",
 ]
