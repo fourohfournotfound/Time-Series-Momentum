@@ -3,11 +3,12 @@
 Monthly momentum backtest — Colab-friendly (SQLite), optimized, metrics-rich, reproducible.
 
 Fixes in this version:
+  • BUGFIX: argparse attribute uses underscores. Replaced args.use-entropy-filter → args.use_entropy_filter
+    and set dest="use_entropy_filter" in add_argument.
   • Respects --database-url (defaults to sqlite:///universe.db); no MySQL required.
-  • Removes hard mysql.connector import; uses SQLAlchemy engine for any DB.
   • One-shot OHLC fetch per ticker over the whole backtest window (prefetch) with retry/backoff.
   • Full backtest metrics + plots (CAGR, AnnVol, Sharpe, Sortino, MaxDD, hit rate, rolling Sharpe).
-  • Exact 'classic' parity with original QG logic (same 12-1 window, daily rounding, SPY merge).  # see QG code refs
+  • Exact 'classic' parity with original QG logic (same 12-1 window, daily rounding, SPY merge).
 
 Quant guardrails:
   • Strict t-1 usage (12-1 window) and forward returns only in the next month (no look-ahead).
@@ -34,7 +35,7 @@ from pandas_market_calendars import get_calendar
 # These keep (date,ticker) MultiIndex invariants & t-1 causality.
 # If these modules are not present, you can comment them out safely.
 try:
-    from relative_market_features import add_entropy_info_features, ewm_moments, latest_per_ticker
+    from custom_relative_market_features import add_entropy_info_features, ewm_moments, latest_per_ticker
 except Exception:
     add_entropy_info_features = None
     ewm_moments = None
@@ -55,7 +56,9 @@ def parse_args():
                    help="Scoring mode")
     p.add_argument("--vol-estimator", default="t", help="Accepted for compatibility; not used in classic")
     p.add_argument("--prefetch", action="store_true", help="Prefetch all bars once for entire backtest window")
-    p.add_argument("--use-entropy-filter", action="store_true", help="Optional entropy/peer information filter (t-1)")
+    # BUGFIX: explicitly set dest to ensure attribute name
+    p.add_argument("--use-entropy-filter", dest="use_entropy_filter", action="store_true",
+                   help="Optional entropy/peer information filter (t-1)")
     p.add_argument("--max-workers", type=int, default=12, help="Concurrency for network fetches")
     p.add_argument("--ewm-halflife", type=int, default=63, help="EWM halflife for EWMA modes")
     return p.parse_args()
@@ -147,7 +150,6 @@ def main():
 
     # Engine selection respects --database-url (SQLite works out of the box in Colab)
     engine = create_engine(args.database_url)  # e.g., sqlite:///universe.db
-    # SQLAlchemy URLs & SQLite URL shape: https://docs.sqlalchemy.org/en/latest/dialects/sqlite.html
 
     # Environment keys
     polygon_api_key = os.getenv("POLYGON_API_KEY")
@@ -157,7 +159,6 @@ def main():
     # Calendar & month list (NYSE)
     calendar = get_calendar("NYSE")
     trading_dates = calendar.schedule(start_date=args.start_date, end_date=(datetime.today() - timedelta(days=1))).index
-    # Month 'starts' (normalize; drop duplicates)
     months_all = trading_dates.to_series().dt.tz_localize(None).dt.normalize().drop_duplicates(keep="first").dt.strftime("%Y-%m-%d").values
 
     # Universe PIT (from your table)
@@ -296,7 +297,8 @@ def main():
                 "12-1_return": tkr_ret_period, "mom_score": mom_score, "forward_returns": fwd_ret, "exit_date": next_month
             })
 
-            if args.use-entropy-filter and add_entropy_info_features is not None:
+            # BUGFIX LINE: use the underscore form produced by argparse
+            if args.use_entropy_filter and add_entropy_info_features is not None:
                 tmp = df[df["date"] < last_month_date][["c", "date"]].copy(); tmp["ticker"] = ticker
                 entropy_panel_parts.append(tmp)
 
