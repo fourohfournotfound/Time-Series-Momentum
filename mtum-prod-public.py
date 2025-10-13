@@ -185,7 +185,8 @@ def _load_price_history(ticker: str, as_of_date: pd.Timestamp) -> pd.DataFrame:
                 timestamps = pd.to_datetime(payload["t"], unit="ms", utc=True).dt.tz_convert(
                     "America/New_York"
                 )
-                payload["date"] = timestamps.dt.tz_localize(None).normalize()
+                naive_timestamps = timestamps.dt.tz_localize(None)
+                payload["date"] = naive_timestamps.dt.normalize()
                 new_df = (
                     payload.dropna(subset=["date"])
                     .drop_duplicates(subset=["date"], keep="last")

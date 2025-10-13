@@ -333,7 +333,8 @@ def _price_history(ticker: str) -> pd.DataFrame:
                 timestamps = pd.to_datetime(raw["t"], unit="ms", utc=True).dt.tz_convert(
                     "America/New_York"
                 )
-                raw["date"] = timestamps.dt.tz_localize(None).normalize()
+                naive_timestamps = timestamps.dt.tz_localize(None)
+                raw["date"] = naive_timestamps.dt.normalize()
                 new_df = (
                     raw.dropna(subset=["date"])
                     .drop_duplicates(subset=["date"], keep="last")
