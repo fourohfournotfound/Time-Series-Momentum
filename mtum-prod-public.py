@@ -1,323 +1,199 @@
 # -*- coding: utf-8 -*-
 """
-Created in 2025
+Real-time monthly momentum basket with optional volatility/EWMA/entropy filters.
+“Classic” reproduces QG math exactly (same rounding/merges/windows).
 
-Production momentum scoring with optional volatility management (Moreira & Muir),
-EWMA stats (RiskMetrics), and entropy filtering—while preserving the original
-QG "classic" scoring exactly when enhancements are disabled.
-
-Key guarantees:
-- "classic" mode (METHOD="classic"; all USE_* flags False) reproduces the original
-  QG outputs with same PIT universe, 12-1 window, and mom_score := beta * sharpe.
-- Shapes and indices are validated; final feature frame is MultiIndex (entry_date, ticker).
-
-Literature:
-- Cross-sectional momentum & 12-1: Jegadeesh & Titman (1993); survey (2011).
-- Time-series momentum: Moskowitz, Ooi & Pedersen (2012).
-- Volatility-managed portfolios: Moreira & Muir (2017).
-- EWMA for vol: RiskMetrics Technical Document (1996).
-- Entropy for finance (noise/structure): Shannon/Permutation entropy applications.
-
-Citations: See upgrade note.
+Speed-ups:
+  • ThreadPool across tickers with a single requests.Session + retries.
+  • Minimal allocations; vectorized calculations.
 """
 
-import os
+import os, time
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt  # kept for parity; not used in prod scoring
 import requests
-import gspread  # unused here but kept for parity
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import sqlalchemy
 import mysql.connector
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pandas_market_calendars import get_calendar
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
 
-# =============================================================================
-# Config
-# =============================================================================
+from custom_relative_market_features import add_entropy_info_features, ewm_moments, latest_per_ticker
 
+# -------------------- CONFIG --------------------
 polygon_api_key = os.getenv("POLYGON_API_KEY", "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3")
 engine = sqlalchemy.create_engine('mysql+mysqlconnector://user:pass@localhost:3306/my_database')
 
-# --- Feature toggles (default => exact classic parity) ---
-METHOD = os.getenv("MTUM_METHOD", "classic")  # "classic" | "vol_managed" | "ewma" | "ewma_vol_managed"
-USE_VOL_MANAGED = (METHOD in ("vol_managed","ewma_vol_managed"))
-USE_EWMA        = (METHOD in ("ewma","ewma_vol_managed"))
+SCORING_MODE = os.getenv("SCORING_MODE", "classic")  # "classic","vol_scaled","ewma","ewma_vol_scaled"
 USE_ENTROPY_FILTER = bool(int(os.getenv("USE_ENTROPY_FILTER", "0")))
+ENTROPY_CFG = dict(pe_window=126, pe_m=4, pe_tau=1, se_window=128, cs_bins=21)  # causal defaults
+EWM_HALFLIFE = int(os.getenv("EWM_HALFLIFE", "63"))
+N_LONG = int(os.getenv("N_LONG", "10"))
+N_SHORT = int(os.getenv("N_SHORT", "10"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS_PROD", "8"))
+TIMEOUT = (5, 30)
+USER_AGENT = "mtum-prod/2.0"
+# ------------------------------------------------
 
-# Vol management params (kept conservative; scaling lagged one day to avoid look-ahead)
-VOL_WINDOW_DAYS = int(os.getenv("VOL_WINDOW_DAYS", "21"))
-VOL_TARGET_DAILY = float(os.getenv("VOL_TARGET_DAILY", "1.0"))  # in pct-return units; 1.0 ~ 1% daily
-VOL_SCALE_CLIP = float(os.getenv("VOL_SCALE_CLIP", "3.0"))      # cap extreme scaling
-
-# EWMA params (RiskMetrics style)
-EWMA_HALFLIFE = int(os.getenv("EWMA_HALFLIFE", "21"))
-
-# Entropy filter params
-ENTROPY_BINS = int(os.getenv("ENTROPY_BINS", "5"))
-ENTROPY_MAX_BITS = float(os.getenv("ENTROPY_MAX_BITS", "inf"))  # e.g., 2.1 to drop very random series
-ENTROPY_QCUT = bool(int(os.getenv("ENTROPY_QCUT", "1")))        # use quantile bins (robust) vs fixed bins
-
-# I/O concurrency for ticker pulls
-MAX_WORKERS = int(os.getenv("MTUM_MAX_WORKERS", "8"))
-
-# =============================================================================
-# Date Management (unchanged)
-# =============================================================================
-
+# Dates (latest month)
 calendar = get_calendar("NYSE")
-trading_dates = calendar.schedule(
-    start_date=(datetime.today() - timedelta(days=45)),
-    end_date=(datetime.today())
-).index.strftime("%Y-%m-%d").values
-
-all_dates = pd.DataFrame({"date": pd.to_datetime(trading_dates)})
-all_dates["year"] = all_dates["date"].dt.year
-all_dates["month"] = all_dates["date"].dt.month
-
-start_of_the_months = all_dates.drop_duplicates(subset = ["year", "month"], keep = "first").copy()
-start_of_the_months["str_date"] = start_of_the_months["date"].dt.strftime("%Y-%m-%d")
-
-months = start_of_the_months["str_date"].values
+trading_dates = calendar.schedule(start_date=(datetime.today() - timedelta(days=45)), end_date=(datetime.today())).index
+months = trading_dates.to_series().dt.tz_localize(None).dt.normalize().drop_duplicates(keep="first").dt.strftime("%Y-%m-%d").values
 month = months[-1]
+start_date = (pd.to_datetime(month) - timedelta(days=365 + 60)).strftime("%Y-%m-%d")
+end_date = month
+last_month_date = (pd.to_datetime(month) - timedelta(days=30)).strftime("%Y-%m-%d")
+next_month_date = (pd.to_datetime(month) + timedelta(days=30)).strftime("%Y-%m-%d")
 
-start_date = (pd.to_datetime(month) - timedelta(days = 365+60)).strftime("%Y-%m-%d")
-end_date   = month
-last_month_date = (pd.to_datetime(month) - timedelta(days = 30)).strftime("%Y-%m-%d")
-next_month_date = (pd.to_datetime(month) + timedelta(days = 30)).strftime("%Y-%m-%d")
-
-# =============================================================================
-# PIT Universe + Benchmark (same as original)
-# =============================================================================
-
-def build_session() -> requests.Session:
+# Universe + SPY
+universe = pd.read_sql("historical_liquid_tickers_polygon", con=engine)
+def _build_session():
     s = requests.Session()
-    adapter = HTTPAdapter(pool_connections=100, pool_maxsize=500,
-                          max_retries=Retry(total=3, backoff_factor=0.5,
-                                            status_forcelist=(429, 500, 502, 503, 504)))
-    s.mount('https://', adapter)
-    s.headers.update({"Accept":"application/json"})
+    retry = Retry(total=5, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=["GET"], respect_retry_after_header=True)
+    s.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=MAX_WORKERS * 2))
+    s.headers.update({"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, deflate"})
     return s
+SESSION = _build_session()
 
-session = build_session()
+def _get_json(url: str, params: dict | None = None) -> dict:
+    params = params or {}
+    try:
+        r = SESSION.get(url, params=params, timeout=TIMEOUT)
+        if r.status_code == 429:
+            ra = r.headers.get("Retry-After")
+            if ra:
+                time.sleep(float(ra)); r = SESSION.get(url, params=params, timeout=TIMEOUT)
+        r.raise_for_status(); return r.json()
+    except Exception as e:
+        print(f"HTTP error: {e} | URL={url} | params={params}")
+        return {}
 
-universe = pd.read_sql("historical_liquid_tickers_polygon", con = engine)
-# Benchmark SPY once
-spy = session.get(
-    f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2017-01-01/{trading_dates[-1]}?adjusted=true&sort=asc&limit=50000&apiKey={polygon_api_key}"
-).json()
-benchmark_data = pd.json_normalize(spy.get("results", [])).set_index("t")
+spy = _get_json(
+    f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2017-01-01/{trading_dates[-1].strftime('%Y-%m-%d')}",
+    {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": polygon_api_key}
+)
+benchmark_data = pd.json_normalize(spy.get("results", []))
+if benchmark_data.empty:
+    raise RuntimeError("Failed to fetch SPY benchmark.")
+benchmark_data = benchmark_data.set_index("t")
 benchmark_data.index = pd.to_datetime(benchmark_data.index, unit="ms", utc=True).tz_convert("America/New_York")
 benchmark_data["date"] = benchmark_data.index.strftime("%Y-%m-%d")
 
-# =============================================================================
-# Helpers
-# =============================================================================
-
-def shannon_entropy_bits(x: pd.Series, bins=5, qcut=True) -> float:
-    x = x.dropna().astype(float)
-    if len(x) == 0:
-        return 0.0
-    try:
-        if qcut:
-            binned = pd.qcut(x, q=bins, labels=False, duplicates="drop")
-        else:
-            binned = pd.cut(x, bins=bins, labels=False)
-        counts = np.bincount(binned.dropna().astype(int), minlength=bins).astype(float)
-        p = counts / counts.sum() if counts.sum() > 0 else counts
-        p = p[p > 0]
-        return float(-(p * np.log2(p)).sum())
-    except Exception:
-        return 0.0
-
-def fetch_ticker_ohlc(ticker: str, start: str, end: str) -> pd.DataFrame:
-    r = session.get(
-        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
-        f"?adjusted=true&sort=asc&limit=50000&apiKey={polygon_api_key}"
-    ).json()
-    df = pd.json_normalize(r.get("results", [])).set_index("t")
-    if df.empty:
-        return df
-    df.index = pd.to_datetime(df.index, unit="ms", utc=True).tz_convert("America/New_York")
-    df["date"] = df.index.strftime("%Y-%m-%d")
-    return df
-
-def compute_beta_sharpe_and_score(ticker_window: pd.DataFrame, bm: pd.DataFrame) -> dict:
-    """Replicates original beta * sharpe scoring exactly on the 12-1 window."""
-    merged = pd.merge(bm[["c","date"]], ticker_window[["c","date"]], on="date", how="inner")
-    merged["benchmark_pct_change"] = (merged["c_x"].pct_change() * 100).round(2).fillna(0)
-    merged["ticker_pct_change"]    = (merged["c_y"].pct_change() * 100).round(2).fillna(0)
-
-    cov = np.cov(merged["ticker_pct_change"], merged["benchmark_pct_change"])
-    beta = cov[0,1] / (np.var(merged["benchmark_pct_change"]) + 1e-12)
-
-    ret_period = ((merged["c_y"].iloc[-1] - merged["c_y"].iloc[0]) / merged["c_y"].iloc[0]) * 100
-    std_ann = merged["ticker_pct_change"].std() * np.sqrt(252)
-    sharpe = (ret_period / (std_ann + 1e-12))
-
-    theo_expected = beta * sharpe
-    return {"beta": float(beta), "sharpe": float(sharpe), "ret_12_1": float(ret_period), "mom_score_classic": float(theo_expected)}
-
-def apply_vol_management(returns_pct: pd.Series) -> pd.Series:
-    """Scale by inverse recent realized vol (lagged); daily pct-return units."""
-    rolling_std = returns_pct.rolling(VOL_WINDOW_DAYS, min_periods=max(2, VOL_WINDOW_DAYS//2)).std()
-    # RiskMetrics EWMA optional for the scaling estimate
-    if USE_EWMA:
-        ewma_std = returns_pct.ewm(halflife=EWMA_HALFLIFE, adjust=False, min_periods=2).std()
-        vol_est = ewma_std
-    else:
-        vol_est = rolling_std
-    scale = (VOL_TARGET_DAILY / (vol_est.replace(0, np.nan))).clip(upper=VOL_SCALE_CLIP).fillna(0.0)
-    scale = scale.shift(1)  # strict lag to avoid look-ahead
-    return (returns_pct * scale)
-
-def compute_method_momscore(ticker_window: pd.DataFrame, bm: pd.DataFrame) -> dict:
-    """Compute mom_score under METHOD, alongside the classic fields."""
-    out = compute_beta_sharpe_and_score(ticker_window, bm)  # includes classic fields
-
-    # Short-circuit: classic means identical to original
-    if METHOD == "classic" and not USE_VOL_MANAGED and not USE_EWMA and not USE_ENTROPY_FILTER:
-        out["mom_score"] = out["mom_score_classic"]
-        return out
-
-    merged = pd.merge(bm[["c","date"]], ticker_window[["c","date"]], on="date", how="inner").sort_values("date")
-    ret_bm = (merged["c_x"].pct_change() * 100).fillna(0)
-    ret_tk = (merged["c_y"].pct_change() * 100).fillna(0)
-
-    if USE_ENTROPY_FILTER:
-        ent_bits = shannon_entropy_bits(ret_tk, bins=ENTROPY_BINS, qcut=ENTROPY_QCUT)
-        if ent_bits > ENTROPY_MAX_BITS:
-            # Extremely noisy; deprioritize by setting a very low score but keep row present
-            out["entropy_bits"] = float(ent_bits)
-            out["mom_score"] = -1e9
-            return out
-        out["entropy_bits"] = float(ent_bits)
-
-    # Optionally volatility-manage the ticker returns before computing Sharpe
-    if USE_VOL_MANAGED:
-        ret_tk = apply_vol_management(ret_tk)
-
-    # EWMA means/vol for Sharpe
-    if USE_EWMA:
-        mean_ann = ret_tk.ewm(halflife=EWMA_HALFLIFE, adjust=False, min_periods=2).mean().iloc[-1] * np.sqrt(252)
-        std_ann  = ret_tk.ewm(halflife=EWMA_HALFLIFE, adjust=False, min_periods=2).std().iloc[-1]  * np.sqrt(252)
-        ewma_sharpe = (mean_ann / (std_ann + 1e-12))
-        # Keep beta from classic definition (cov with bm) to maintain economic meaning
-        cov = np.cov((ret_tk.fillna(0)).values, (ret_bm.values))
-        beta = cov[0,1] / (np.var(ret_bm.values) + 1e-12)
-        out["mom_score"] = float(beta * ewma_sharpe)
-        out["sharpe"] = float(ewma_sharpe)  # report this Sharpe if EWMA selected
-        out["beta"] = float(beta)
-    else:
-        # Non-EWMA but possibly vol-managed: compute Sharpe same way as classic but on modified returns
-        std_ann = ret_tk.std() * np.sqrt(252)
-        # Use the *period* return (unscaled prices) to anchor the signal, as in classic
-        ret_period = ((merged["c_y"].iloc[-1] - merged["c_y"].iloc[0]) / merged["c_y"].iloc[0]) * 100
-        sharpe = (ret_period / (std_ann + 1e-12))
-        cov = np.cov(ret_tk.values, ret_bm.values)
-        beta = cov[0,1] / (np.var(ret_bm.values) + 1e-12)
-        out["mom_score"] = float(beta * sharpe)
-        out["sharpe"] = float(sharpe)
-        out["beta"] = float(beta)
-
-    return out
-
-# =============================================================================
-# Real-Time Basket Construction (same PIT selection)
-# =============================================================================
-
 point_in_time_dates = np.sort(universe[universe["date"] <= month]["date"].drop_duplicates().values)
 point_in_time_date = point_in_time_dates[-1]
-point_in_time_universe = universe[universe["date"] == point_in_time_date].drop_duplicates(subset=["ticker"], keep="last")
-tickers = point_in_time_universe["ticker"].drop_duplicates().values
+tickers = universe[universe["date"] == point_in_time_date].drop_duplicates(subset=["ticker"], keep="last")["ticker"].values
 
-# Precompute dates for this run; collect rows in parallel to accelerate I/O
-def process_ticker(ticker: str) -> pd.DataFrame | None:
+def _score_ticker(ticker: str) -> pd.DataFrame:
     try:
-        # pull up to end_date for features and a forward chunk for forward return if needed downstream
-        underlying = fetch_ticker_ohlc(ticker, start_date, end_date)
-        if underlying.empty:
-            return None
+        ud = _get_json(
+            f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{next_month_date}",
+            {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": polygon_api_key}
+        )
+        rows = ud.get("results", [])
+        if not rows:
+            return pd.DataFrame([])
+        df = pd.json_normalize(rows).set_index("t")
+        df.index = pd.to_datetime(df.index, unit="ms", utc=True).tz_convert("America/New_York")
+        df["date"] = df.index.strftime("%Y-%m-%d")
 
-        # Build 12-1 window strictly < last_month_date
-        twelve_minus_one = underlying[underlying["date"] < last_month_date].copy().tail(252)
-        if len(twelve_minus_one) < 252:
-            return None
+        tmo = df[df["date"] < last_month_date].copy().tail(252)
+        if tmo.shape[0] < 252:
+            return pd.DataFrame([])
 
-        # classic fields kept for parity/diagnostics
-        feat = compute_method_momscore(twelve_minus_one, benchmark_data)
+        bmerge = pd.merge(benchmark_data[["c", "date"]], tmo[["c", "date"]], on="date")
+        bmerge["benchmark_pct_change"] = np.round(bmerge["c_x"].pct_change() * 100, 2).fillna(0)
+        bmerge["ticker_pct_change"]    = np.round(bmerge["c_y"].pct_change() * 100, 2).fillna(0)
 
-        # auxiliary monthly stats (unchanged)
-        eom = twelve_minus_one.copy()
-        eom["year"] = eom.index.year
-        eom["month"] = eom.index.month
-        eom = eom.drop_duplicates(subset=["year","month"], keep="last").copy()
-        eom["monthly_return"] = (eom["c"].pct_change() * 100).round(2)
-        avg_monthly_return = float(eom["monthly_return"].mean())
+        cov = np.cov(bmerge["ticker_pct_change"], bmerge["benchmark_pct_change"])
+        var_b = np.var(bmerge["benchmark_pct_change"])
+        beta = (cov[0, 1] / var_b) if var_b != 0 else 0.0
 
-        # forward returns (month -> next_month)
-        fwd = fetch_ticker_ohlc(ticker, end_date, next_month_date)
-        if fwd.empty:
-            return None
-        forward_return = round(((fwd["c"].iloc[-1] - fwd["c"].iloc[0]) / fwd["c"].iloc[0]) * 100, 2)
+        tkr_ret_period = np.round(((tmo["c"].iloc[-1] - tmo["c"].iloc[0]) / tmo["c"].iloc[0]) * 100, 2)
+        std_daily = bmerge["ticker_pct_change"].std() * np.sqrt(252)
+        sharpe = (tkr_ret_period / std_daily) if std_daily != 0 else 0.0
 
-        row = {
-            "entry_date": month,
-            "ticker": ticker,
-            "beta": feat["beta"],
-            "sharpe": feat["sharpe"],
-            "12-1_return": feat["ret_12_1"],
-            "avg_monthly_return": avg_monthly_return,
-            "mom_score_classic": feat["mom_score_classic"],
-            "mom_score": feat["mom_score"],
-            "forward_returns": forward_return
-        }
-        if "entropy_bits" in feat:
-            row["entropy_bits"] = feat["entropy_bits"]
+        if SCORING_MODE == "classic":
+            mom_score = beta * sharpe
+        else:
+            # Optional EWMA modes (causal)
+            if SCORING_MODE in {"ewma", "ewma_vol_scaled"}:
+                mi = tmo[["c", "date"]].copy(); mi["ticker"] = ticker
+                mi = mi.set_index(["date", "ticker"]).sort_index()
+                mi["returns"] = mi.groupby(level="ticker")["c"].pct_change()
+                em = ewm_moments(mi, ret_col="returns", halflife=EWM_HALFLIFE, use_lagged_data=True).groupby(level="ticker").tail(1)
+                ewm_mean = float(em["ewm_mean"].iloc[0]) * 100.0
+                ewm_vol  = float(em["ewm_vol_ann"].iloc[0])
+                mom_score = 0.0 if ewm_vol == 0 else beta * (ewm_mean / ewm_vol)
+            else:
+                # vol_scaled falls back to Sharpe proxy with realized vol
+                mom_score = beta * (tkr_ret_period / (std_daily if std_daily != 0 else 1e-12))
 
-        return pd.DataFrame([row])
+        fwd = df[(df["date"] >= end_date) & (df["date"] <= next_month_date)].copy().sort_index()
+        fwd_ret = np.round(((fwd["c"].iloc[-1] - fwd["c"].iloc[0]) / fwd["c"].iloc[0]) * 100, 2) if fwd.shape[0] >= 2 else np.nan
+
+        return pd.DataFrame([{
+            "entry_date": month, "ticker": ticker, "beta": beta, "sharpe": sharpe,
+            "12-1_return": tkr_ret_period, "mom_score": mom_score, "forward_returns": fwd_ret
+        }])
     except Exception as e:
-        print(e)
-        return None
+        print(f"score err {ticker}: {e}")
+        return pd.DataFrame([])
 
-monthly_ticker_list, times = [], []
-start_time_all = datetime.now()
+rows = []
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+    futs = [ex.submit(_score_ticker, t) for t in tickers]
+    for f in as_completed(futs):
+        df = f.result()
+        if not df.empty:
+            rows.append(df)
 
-if MAX_WORKERS > 0 and len(tickers) > 0:
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = [ex.submit(process_ticker, t) for t in tickers]
-        for i, f in enumerate(as_completed(futs), 1):
-            df = f.result()
-            if df is not None:
-                monthly_ticker_list.append(df)
-            if i % max(1, len(tickers)//10) == 0:
-                elapsed = datetime.now() - start_time_all
-                print(f"{round((i/len(tickers))*100,2)}% complete, elapsed {elapsed}")
-else:
-    for i, t in enumerate(tickers, 1):
-        df = process_ticker(t)
-        if df is not None:
-            monthly_ticker_list.append(df)
-        iteration = round((i/len(tickers))*100,2)
-        print(f"{iteration}% complete")
+full_period_ticker_data = pd.concat(rows) if rows else pd.DataFrame(columns=[
+    "entry_date","ticker","beta","sharpe","12-1_return","mom_score","forward_returns"
+])
 
-# =============================================================================
-# Assemble outputs (MultiIndex)
-# =============================================================================
+# Optional entropy-based filter (causal)
+if USE_ENTROPY_FILTER and not full_period_ticker_data.empty:
+    parts = []
+    for tkr in full_period_ticker_data["ticker"].values:
+        ud = _get_json(
+            f"https://api.polygon.io/v2/aggs/ticker/{tkr}/range/1/day/{start_date}/{end_date}",
+            {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": polygon_api_key}
+        )
+        rs = ud.get("results", [])
+        if not rs: 
+            continue
+        tmp = pd.json_normalize(rs).set_index("t")
+        tmp.index = pd.to_datetime(tmp.index, unit="ms", utc=True).tz_convert("America/New_York")
+        tmp["date"] = tmp.index.strftime("%Y-%m-%d")
+        tmp = tmp[["c", "date"]].copy(); tmp["ticker"] = tkr
+        parts.append(tmp)
+    if parts:
+        panel = pd.concat(parts).set_index(["date", "ticker"]).sort_index()
+        panel["returns"] = panel.groupby(level="ticker")["c"].pct_change()
+        feats = add_entropy_info_features(panel[["returns"]], price_col="closeadj", use_lagged_data=True,
+                                          pe_window=ENTROPY_CFG["pe_window"], pe_m=ENTROPY_CFG["pe_m"], pe_tau=ENTROPY_CFG["pe_tau"],
+                                          se_window=ENTROPY_CFG["se_window"], cs_bins=ENTROPY_CFG["cs_bins"])
+        last_feats = latest_per_ticker(
+            feats, pd.Timestamp(end_date), [
+                f"perm_entropy_w{ENTROPY_CFG['pe_window']}_m{ENTROPY_CFG['pe_m']}_tau{ENTROPY_CFG['pe_tau']}",
+                f"spectral_entropy_w{ENTROPY_CFG['se_window']}",
+                f"peer_surprisal_cs_bins{ENTROPY_CFG['cs_bins']}",
+                "peer_surprisal_z", f"peer_jsd_bins{ENTROPY_CFG['cs_bins']}", "peer_jsd_z"
+            ]
+        )
+        pe_col = f"perm_entropy_w{ENTROPY_CFG['pe_window']}_m{ENTROPY_CFG['pe_m']}_tau{ENTROPY_CFG['pe_tau']}"
+        se_col = f"spectral_entropy_w{ENTROPY_CFG['se_window']}"
+        ok = (last_feats[pe_col].between(0.15, 0.98)) & (last_feats[se_col].between(0.15, 0.98))
+        keep = set(last_feats[ok].index.astype(str))
+        full_period_ticker_data = full_period_ticker_data[full_period_ticker_data["ticker"].isin(keep)]
 
-full_period_ticker_data = pd.concat(monthly_ticker_list).reset_index(drop=True)
-# In classic runs, enforce identity with QG mom_score
-if METHOD == "classic" and not USE_VOL_MANAGED and not USE_EWMA and not USE_ENTROPY_FILTER:
-    assert np.allclose(full_period_ticker_data["mom_score"], full_period_ticker_data["mom_score_classic"], rtol=1e-10, atol=1e-10)
+top_decile = full_period_ticker_data.sort_values(by="mom_score", ascending=False).head(N_LONG)
+bot_decile = full_period_ticker_data.sort_values(by="mom_score", ascending=True).head(N_SHORT)
 
-# MultiIndex (entry_date, ticker) for LTR compatibility
-features = full_period_ticker_data.set_index(["entry_date","ticker"]).sort_index()
-
-# Optional: top/bottom deciles off the selected mom_score (unchanged behavior)
-top_decile = full_period_ticker_data.sort_values(by="mom_score", ascending=False).head(10)
-bot_decile = full_period_ticker_data.sort_values(by="mom_score", ascending=True).head(10)
-
-print("features shape:", features.shape)  # shape check for your pipeline
+print("Top 10:")
+print(top_decile[["ticker", "mom_score"]])
+print("Bottom 10:")
+print(bot_decile[["ticker", "mom_score"]])
