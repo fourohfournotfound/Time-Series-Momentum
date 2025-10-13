@@ -451,25 +451,29 @@ for covered_date in covered_dates:
     trade_data = pd.DataFrame(
         {
             "date": [covered_date],
-            "long": [long_uni["forward_returns"].mean()],
-            "short": [short_uni["forward_returns"].mean() * -1],
+            "long_return": [long_uni["forward_returns"].mean() / 100.0],
+            "short_return": [(-short_uni["forward_returns"].mean()) / 100.0],
         }
     )
+    trade_data["portfolio_return"] = trade_data["long_return"] + trade_data["short_return"]
     trade_list.append(trade_data)
 
 if trade_list:
     all_trades = pd.concat(trade_list).sort_values("date")
-    all_trades["long_pnl"] = all_trades["long"].cumsum()
-    all_trades["short_pnl"] = all_trades["short"].cumsum()
-    all_trades["portfolio_pnl"] = all_trades["long_pnl"] + all_trades["short_pnl"]
+    all_trades.reset_index(drop=True, inplace=True)
+
+    all_trades["long_equity"] = (1.0 + all_trades["long_return"]).cumprod()
+    all_trades["short_equity"] = (1.0 + all_trades["short_return"]).cumprod()
+    all_trades["portfolio_equity"] = (1.0 + all_trades["portfolio_return"]).cumprod()
 
     plt.figure(figsize=(12, 7), dpi=200)
     plt.xticks(rotation=45)
     plt.suptitle("Gross Cumulative Performance")
     plt.title("Monthly Rebalancing")
-    plt.plot(pd.to_datetime(all_trades["date"]), all_trades["long_pnl"])
-    plt.plot(pd.to_datetime(all_trades["date"]), all_trades["short_pnl"])
-    plt.plot(pd.to_datetime(all_trades["date"]), all_trades["portfolio_pnl"])
+    timeline = pd.to_datetime(all_trades["date"])
+    plt.plot(timeline, (all_trades["long_equity"] - 1.0) * 100.0)
+    plt.plot(timeline, (all_trades["short_equity"] - 1.0) * 100.0)
+    plt.plot(timeline, (all_trades["portfolio_equity"] - 1.0) * 100.0)
     plt.legend(["Top Decile", "Bottom Decile", "Long-Short"])
     plt.xlabel("Date")
     plt.ylabel("Cumulative % Returns")
@@ -479,8 +483,8 @@ if trade_list:
     plt.show()
     plt.close()
 
-    monthly_returns = (all_trades["long"] + all_trades["short"]) / 100.0
-    cumulative = (1 + monthly_returns).cumprod()
+    monthly_returns = all_trades["portfolio_return"]
+    cumulative = all_trades["portfolio_equity"]
     years = len(monthly_returns) / 12.0 if len(monthly_returns) else 0
     cagr = cumulative.iloc[-1] ** (1 / years) - 1 if years > 0 else np.nan
     volatility = monthly_returns.std(ddof=1) * np.sqrt(12) if len(monthly_returns) > 1 else np.nan
