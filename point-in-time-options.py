@@ -34,6 +34,10 @@ NOTIONAL_VOLUME_THRESHOLD = float(os.getenv("PIT_NOTIONAL_THRESHOLD", "5e7"))
 MAX_PAGES = 20
 MAX_TICKERS_PER_MONTH = int(os.getenv("PIT_MAX_TICKERS", "350"))
 
+USE_DATABASE = os.getenv(
+    "PIT_USE_DATABASE", os.getenv("MTUM_USE_DATABASE", "0")
+).lower() in {"1", "true", "yes", "y"}
+
 DB_ENGINE = sqlalchemy.create_engine(
     "mysql+mysqlconnector://user:pass@localhost:3306/my_database"
 )
@@ -154,15 +158,22 @@ def _load_existing_universe() -> pd.DataFrame:
     """Load previously stored PIT universe rows if present."""
 
     # Prefer database, then pickle, finally CSV.
-    try:
-        existing = pd.read_sql(
-            "SELECT as_of_date, rebalance_date, ticker, avg_days_between FROM historical_liquid_tickers_polygon",
-            con=DB_ENGINE,
+    if USE_DATABASE:
+        try:
+            existing = pd.read_sql(
+                "SELECT as_of_date, rebalance_date, ticker, avg_days_between FROM historical_liquid_tickers_polygon",
+                con=DB_ENGINE,
+            )
+            print("Loaded existing PIT universe from database.")
+            return existing
+        except Exception as exc:  # pragma: no cover - DB guardrail
+            print(
+                f"[WARN] Unable to load universe from MySQL ({exc}). Falling back to local cache..."
+            )
+    else:
+        print(
+            "Skipping MySQL universe load (PIT_USE_DATABASE disabled). Using local cache."
         )
-        print("Loaded existing PIT universe from database.")
-        return existing
-    except Exception:
-        pass
 
     if os.path.exists(PICKLE_FALLBACK_PATH):
         try:

@@ -26,6 +26,7 @@ from pandas_market_calendars import get_calendar
 
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3")
+USE_DATABASE = os.getenv("MTUM_USE_DATABASE", "0").lower() in {"1", "true", "yes", "y"}
 DB_ENGINE = sqlalchemy.create_engine(
     "mysql+mysqlconnector://user:pass@localhost:3306/my_database"
 )
@@ -267,12 +268,24 @@ def _load_universe() -> pd.DataFrame:
     """Load the PIT universe, preferring MySQL but falling back to CSV."""
 
     loaded_from_csv = False
-    try:
-        df = pd.read_sql("SELECT * FROM historical_liquid_tickers_polygon", con=DB_ENGINE)
-        print("Loaded PIT universe from MySQL database.")
-    except Exception as exc:  # pragma: no cover - DB guardrail
-        print(f"[WARN] Unable to load universe from MySQL ({exc}). Trying local cache...")
-        df = None
+    df: pd.DataFrame | None = None
+
+    if USE_DATABASE:
+        try:
+            df = pd.read_sql(
+                "SELECT * FROM historical_liquid_tickers_polygon", con=DB_ENGINE
+            )
+            print("Loaded PIT universe from MySQL database.")
+        except Exception as exc:  # pragma: no cover - DB guardrail
+            print(
+                f"[WARN] Unable to load universe from MySQL ({exc}). Falling back to local cache..."
+            )
+
+    if df is None:
+        if not USE_DATABASE:
+            print(
+                "Skipping MySQL universe load (MTUM_USE_DATABASE disabled). Using local cache."
+            )
         if os.path.exists(PICKLE_FALLBACK_PATH):
             try:
                 df = pd.read_pickle(PICKLE_FALLBACK_PATH)
@@ -283,7 +296,7 @@ def _load_universe() -> pd.DataFrame:
             if not os.path.exists(CSV_FALLBACK_PATH):
                 raise RuntimeError(
                     "No PIT universe available: database unreachable and local fallbacks missing."
-                ) from exc
+                )
             df = pd.read_csv(CSV_FALLBACK_PATH)
             print(f"Loaded PIT universe from CSV fallback at {CSV_FALLBACK_PATH}.")
             loaded_from_csv = True
@@ -382,8 +395,8 @@ def _compute_features_for_ticker(
             FEATURE_CACHE[cache_key] = {}
         return {}
 
-    merged["ret_m"].fillna(0.0, inplace=True)
-    merged["ret_s"].fillna(0.0, inplace=True)
+    merged["ret_m"] = merged["ret_m"].fillna(0.0)
+    merged["ret_s"] = merged["ret_s"].fillna(0.0)
 
     cov = np.cov(merged["ret_s"], merged["ret_m"])
     beta = 0.0 if cov[1, 1] == 0 else cov[0, 1] / cov[1, 1]
@@ -479,9 +492,9 @@ ranked["score"] = ranked["mom_vol_scaled"].where(
     np.isfinite(ranked["mom_vol_scaled"]),
     np.nan,
 )
-ranked["score"].fillna(ranked["resid_mom"], inplace=True)
-ranked["score"].fillna(ranked["mom_12_1"], inplace=True)
-ranked.sort_values(by="score", ascending=False, inplace=True)
+ranked["score"] = ranked["score"].fillna(ranked["resid_mom"])
+ranked["score"] = ranked["score"].fillna(ranked["mom_12_1"])
+ranked = ranked.sort_values(by="score", ascending=False)
 
 top_decile = ranked.groupby(level=0).head(10).reset_index()["ticker"].tolist()
 bottom_decile = ranked.groupby(level=0).tail(10).reset_index()["ticker"].tolist()
