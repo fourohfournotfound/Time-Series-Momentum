@@ -35,9 +35,26 @@ CSV_FALLBACK_PATH = os.getenv("PIT_UNIVERSE_CSV", "historical_liquid_tickers.csv
 nyse = get_calendar("NYSE")
 
 
+def _calendar_bound(ts: datetime) -> pd.Timestamp:
+    """Convert arbitrary timestamp to NYSE calendar input (tz-naive New York)."""
+
+    stamp = pd.Timestamp(ts)
+    if stamp.tzinfo is None:
+        return stamp
+    return stamp.tz_convert("America/New_York").tz_localize(None)
+
+
 def trading_days(start_date: datetime, end_date: datetime) -> pd.DatetimeIndex:
-    schedule = nyse.schedule(start_date=start_date, end_date=end_date)
-    return schedule.index.tz_convert("America/New_York")
+    schedule = nyse.schedule(
+        start_date=_calendar_bound(start_date),
+        end_date=_calendar_bound(end_date),
+    )
+    index = schedule.index
+    if index.tz is None:
+        index = index.tz_localize("America/New_York")
+    else:
+        index = index.tz_convert("America/New_York")
+    return index
 
 
 def _get(url: str, params: dict | None = None) -> dict:
