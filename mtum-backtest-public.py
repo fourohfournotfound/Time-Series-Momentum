@@ -15,7 +15,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import requests
 import sqlalchemy
-import mysql.connector
+import warnings
+from typing import Optional
 from datetime import datetime, timedelta
 from pandas_market_calendars import get_calendar
 
@@ -49,27 +50,28 @@ trading_dates = calendar.schedule(
 # =============================================================================
 # Base Point-in-Time Universe + Benchmark
 # =============================================================================
-# Prefer loading the point-in-time universe from MySQL so the public script
-# retains parity with the in-house environment.  When the database is not
-# reachable (e.g. during documentation builds or on hosted notebooks) we fall
-# back to the checked-in CSV extract so that the rest of the backtest can still
-# run end-to-end.
-universe = None
+engine = None
+universe: Optional[pd.DataFrame] = None
 try:
     engine = sqlalchemy.create_engine('mysql+mysqlconnector://user:pass@localhost:3306/my_database')
-    universe = pd.read_sql(
-        "historical_liquid_tickers_polygon",
-        con=engine
-    ).drop_duplicates(subset=["date", "ticker"])
-except Exception as db_error:
-    print(
-        "Warning: unable to connect to MySQL (" \
-        f"{db_error}). Falling back to local CSV extract."
+    with engine.connect() as connection:
+        universe = pd.read_sql(
+            "historical_liquid_tickers_polygon",
+            con=connection
+        ).drop_duplicates(subset=["date", "ticker"])
+except (ModuleNotFoundError, sqlalchemy.exc.SQLAlchemyError) as db_error:
+    warnings.warn(
+        f"Warning: unable to connect to MySQL ({db_error}). Falling back to local CSV extract.",
+        RuntimeWarning,
+        stacklevel=2,
     )
     universe = pd.read_csv("historical_liquid_tickers.csv")
-    for redundant_col in {"Unnamed: 0", "index"}:
-        if redundant_col in universe.columns:
-            universe = universe.drop(columns=[redundant_col])
+    redundant_cols = [col for col in ("Unnamed: 0", "index") if col in universe.columns]
+    if redundant_cols:
+        universe = universe.drop(columns=redundant_cols)
+finally:
+    if engine is not None:
+        engine.dispose()
 
 if universe is None:
     raise RuntimeError("Failed to load point-in-time universe from both MySQL and CSV sources.")
