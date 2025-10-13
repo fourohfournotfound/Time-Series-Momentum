@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 import requests
 import sqlalchemy
 import warnings
-from typing import Optional
+from typing import Dict, Optional
 from datetime import datetime, timedelta
 from pandas_market_calendars import get_calendar
 
@@ -77,20 +77,34 @@ if universe is None:
     raise RuntimeError("Failed to load point-in-time universe from both MySQL and CSV sources.")
 
 if "date" in universe.columns:
-    universe["date"] = pd.to_datetime(universe["date"]).dt.strftime("%Y-%m-%d")
+    universe["date"] = pd.to_datetime(universe["date"], utc=False)
 
 universe = universe.drop_duplicates(subset=["date", "ticker"])
+universe = universe.sort_values(["date", "ticker"])
 
 connection_session = requests.Session()
 connection_session.headers.update({"User-Agent": "mtum-backtest/1.0"})
 
-bench = connection_session.get(
-    f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2017-01-01/{trading_dates[-1]}"
-    f"?adjusted=true&sort=asc&limit=50000&apiKey={polygon_api_key}"
-).json()
+polygon_params = {
+    "adjusted": "true",
+    "sort": "asc",
+    "limit": 50000,
+    "apiKey": polygon_api_key,
+}
+POLYGON_TIMEOUT = 30
+
+bench_response = connection_session.get(
+    f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2017-01-01/{trading_dates[-1]}",
+    params=polygon_params,
+    timeout=POLYGON_TIMEOUT,
+)
+bench_response.raise_for_status()
+bench = bench_response.json()
 benchmark_data = pd.json_normalize(bench["results"]).set_index("t")
-benchmark_data.index = pd.to_datetime(benchmark_data.index, unit="ms", utc=True).tz_convert("America/New_York")
-benchmark_data["date"] = benchmark_data.index.strftime("%Y-%m-%d")
+benchmark_index = pd.to_datetime(benchmark_data.index, unit="ms", utc=True).tz_convert("America/New_York")
+benchmark_data.index = benchmark_index
+benchmark_data["date"] = benchmark_index.tz_localize(None).normalize()
+benchmark_panel = benchmark_data.loc[:, ["c", "date"]]
 
 # =============================================================================
 # Backtesting - Feature Generation + Forward Return Calc
@@ -100,36 +114,80 @@ top_decile_list = []
 bot_decile_list = []
 times = []
 
-months = universe["date"].drop_duplicates().values
+months_index = universe["date"].drop_duplicates().sort_values()
+months = months_index.to_list()
 
-def _score_month(month: str) -> pd.DataFrame:
-    point_in_time_dates = np.sort(universe[universe["date"] <= month]["date"].drop_duplicates().values)
-    point_in_time_date = point_in_time_dates[-1]
-    point_in_time_universe = universe[universe["date"] == point_in_time_date].drop_duplicates(subset=["ticker"], keep="last")
-    tickers = point_in_time_universe["ticker"].drop_duplicates().values
+if len(months) < 2:
+    raise RuntimeError("Universe must contain at least two monthly observations for the backtest.")
 
-    start_date = (pd.to_datetime(month) - timedelta(days=365 + 60)).strftime("%Y-%m-%d")
-    end_date = month
-    next_month_date = np.sort(months[months > month])[0]
-    last_month_date = (pd.to_datetime(month) - timedelta(days=30)).strftime("%Y-%m-%d")
+month_strings = pd.Index(months).strftime("%Y-%m-%d").to_numpy()
+
+point_in_time_snapshots: Dict[pd.Timestamp, pd.DataFrame] = {
+    date: snapshot.copy()
+    for date, snapshot in universe.groupby("date", sort=True)
+}
+
+global_price_start = (months[0] - pd.Timedelta(days=365 + 60)).strftime("%Y-%m-%d")
+global_price_end = months[-1].strftime("%Y-%m-%d")
+
+price_cache: Dict[str, pd.DataFrame] = {}
+
+
+def _load_polygon_history(ticker: str) -> pd.DataFrame:
+    if ticker in price_cache:
+        return price_cache[ticker]
+
+    response = connection_session.get(
+        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{global_price_start}/{global_price_end}",
+        params=polygon_params,
+        timeout=POLYGON_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    results = payload.get("results", [])
+    if not results:
+        empty = pd.DataFrame(columns=["c", "t"]).set_index(pd.Index([], name="t"))
+        price_cache[ticker] = empty
+        return empty
+
+    data = pd.json_normalize(results).set_index("t")
+    idx = pd.to_datetime(data.index, unit="ms", utc=True).tz_convert("America/New_York")
+    data.index = idx
+    local_dates = idx.tz_localize(None).normalize()
+    data["date"] = local_dates
+    price_cache[ticker] = data
+    return data
+
+
+def _score_month(index: int) -> pd.DataFrame:
+    month = months[index]
+    next_month = months[index + 1]
+    point_in_time_universe = point_in_time_snapshots.get(month)
+    if point_in_time_universe is None or point_in_time_universe.empty:
+        return pd.DataFrame([])
+
+    tickers = point_in_time_universe["ticker"].to_numpy()
+
+    start_date = month - pd.Timedelta(days=365 + 60)
+    last_month_date = month - pd.Timedelta(days=30)
 
     monthly_rows = []
 
     # (Optionally) collect inputs for entropy in one go (panel)
     panel_parts = []
 
+    month_str = month.strftime("%Y-%m-%d")
+    next_month_str = next_month.strftime("%Y-%m-%d")
+
     for ticker in tickers:
         try:
-            ud = connection_session.get(
-                f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{next_month_date}"
-                f"?adjusted=true&sort=asc&limit=50000&apiKey={polygon_api_key}"
-            ).json()
-            if "results" not in ud:
+            history = _load_polygon_history(ticker)
+            if history.empty:
                 continue
 
-            data = pd.json_normalize(ud["results"]).set_index("t")
-            data.index = pd.to_datetime(data.index, unit="ms", utc=True).tz_convert("America/New_York")
-            data["date"] = data.index.strftime("%Y-%m-%d")
+            data = history[(history["date"] >= start_date) & (history["date"] <= next_month)].copy()
+            if data.empty:
+                continue
 
             twelve_minus_one = data[data["date"] < last_month_date].copy().tail(252)
             if len(twelve_minus_one) < 252:
@@ -137,16 +195,16 @@ def _score_month(month: str) -> pd.DataFrame:
 
             # Merge with benchmark (QG exact)
             bmerge = pd.merge(
-                left=benchmark_data[["c", "date"]],
+                left=benchmark_panel,
                 right=twelve_minus_one[["c", "date"]],
                 on="date"
             )
             bmerge["benchmark_pct_change"] = np.round(bmerge["c_x"].pct_change() * 100, 2).fillna(0)
-            bmerge["ticker_pct_change"]    = np.round(bmerge["c_y"].pct_change() * 100, 2).fillna(0)
+            bmerge["ticker_pct_change"] = np.round(bmerge["c_y"].pct_change() * 100, 2).fillna(0)
 
             covmat = np.cov(bmerge["ticker_pct_change"], bmerge["benchmark_pct_change"])
             cov_tb = covmat[0, 1]
-            var_b  = np.var(bmerge["benchmark_pct_change"])
+            var_b = np.var(bmerge["benchmark_pct_change"])
             beta = cov_tb / var_b if var_b != 0 else 0.0
 
             tkr_ret_period = np.round(((twelve_minus_one["c"].iloc[-1] - twelve_minus_one["c"].iloc[0]) /
@@ -163,10 +221,10 @@ def _score_month(month: str) -> pd.DataFrame:
                 ewm_stats = ewm_moments(mdf, ret_col="returns", halflife=EWM_HALFLIFE, use_lagged_data=True)
                 ewm_last = ewm_stats.groupby(level="ticker").tail(1)
                 ewm_mean = float(ewm_last["ewm_mean"].iloc[0]) * 100.0
-                ewm_vol  = float(ewm_last["ewm_vol_ann"].iloc[0])
+                ewm_vol = float(ewm_last["ewm_vol_ann"].iloc[0])
             else:
                 ewm_mean = None
-                ewm_vol  = None
+                ewm_vol = None
 
             if SCORING_MODE == "classic":
                 mom_score = beta * sharpe
@@ -185,19 +243,19 @@ def _score_month(month: str) -> pd.DataFrame:
             else:
                 mom_score = beta * sharpe
 
-            next_period = data[(data["date"] >= month) & (data["date"] <= next_month_date)].copy().sort_index()
+            next_period = data[(data["date"] >= month) & (data["date"] <= next_month)].copy().sort_index()
             next_ret = np.round(((next_period["c"].iloc[-1] - next_period["c"].iloc[0]) /
                                  next_period["c"].iloc[0]) * 100, 2) if next_period.shape[0] >= 2 else np.nan
 
             monthly_rows.append(pd.DataFrame([{
-                "entry_date": month,
+                "entry_date": month_str,
                 "ticker": ticker,
                 "beta": beta,
                 "sharpe": sharpe,
                 "12-1_return": tkr_ret_period,
                 "mom_score": mom_score,
                 "forward_returns": next_ret,
-                "exit_date": next_month_date
+                "exit_date": next_month_str
             }]))
 
             # Prepare panel for entropy filtering
@@ -224,7 +282,7 @@ def _score_month(month: str) -> pd.DataFrame:
             pe_window=ENTROPY_CFG["pe_window"], pe_m=ENTROPY_CFG["pe_m"], pe_tau=ENTROPY_CFG["pe_tau"],
             se_window=ENTROPY_CFG["se_window"], cs_bins=ENTROPY_CFG["cs_bins"]
         )
-        last_feats = latest_per_ticker(feats, pd.Timestamp(month), [
+        last_feats = latest_per_ticker(feats, month, [
             f"perm_entropy_w{ENTROPY_CFG['pe_window']}_m{ENTROPY_CFG['pe_m']}_tau{ENTROPY_CFG['pe_tau']}",
             f"spectral_entropy_w{ENTROPY_CFG['se_window']}",
             f"peer_surprisal_cs_bins{ENTROPY_CFG['cs_bins']}",
@@ -249,10 +307,12 @@ def _score_month(month: str) -> pd.DataFrame:
     return full_period_ticker_data, top_decile, bot_decile
 
 # Run over months[:-1] exactly like QG
-for month in months[:-1]:
+total_iterations = len(months) - 1
+for idx in range(total_iterations):
+    month_label = month_strings[idx]
     try:
         start_time = datetime.now()
-        out = _score_month(month)
+        out = _score_month(idx)
         if isinstance(out, tuple):
             full_period_ticker_data, top_decile, bot_decile = out
             full_data_list.append(full_period_ticker_data)
@@ -261,11 +321,12 @@ for month in months[:-1]:
 
         seconds_to_complete = (datetime.now() - start_time).total_seconds()
         times.append(seconds_to_complete)
-        iteration = round((np.where(months == month)[0][0] / len(months)) * 100, 2)
-        iterations_remaining = len(months) - np.where(months == month)[0][0]
+        completed = idx + 1
+        iteration = round((completed / total_iterations) * 100, 2)
+        iterations_remaining = total_iterations - completed
         avg_time = np.mean(times)
         eta = (datetime.now() + timedelta(seconds=int(avg_time * iterations_remaining)))
-        print(f"{iteration}% complete, ETA ~ {eta}")
+        print(f"{iteration}% complete after {month_label}, ETA ~ {eta}")
 
     except Exception as macro_error:
         print(macro_error)
