@@ -1,210 +1,106 @@
 # -*- coding: utf-8 -*-
-"""Point-in-time liquid weekly-options universe builder.
+"""
+Created in 2025
 
-This implementation forms the tradable universe for a monthly rebalance
-at the **first trading day of the month** (``rebalance_date``) using only the
-information that was observable at the **prior trading day**
-(``as_of_date``).  Liquidity and options-eligibility checks therefore reflect
-what would have been known when trading decisions are made, eliminating the
-look-ahead present in the previous version that used same-day EOD data.
+Updated: Enforce true point-in-time (PIT) universe with as-of (t-1) and rebalance_date (t).
+- Liquidity screen and options-eligibility evaluated strictly as of t-1 (previous trading day).
+- Stores both as_of_date and rebalance_date to enable leak-free prod/backtest selection.
+- Adds shape checks and safer API handling.
 
-The resulting table contains ``as_of_date``, ``rebalance_date`` and ``ticker``
-columns along with the average spacing between the first five option
-expirations (``avg_days_between``).  These values mirror the schema expected by
-the production and backtest scripts.
+Economic rationale: use prior-day liquidity to ensure tradeable universe at the next day's open.
 """
 
-from __future__ import annotations
-
-import math
 import os
-from datetime import datetime, timedelta, timezone
-from functools import lru_cache
-
-import mysql.connector
-import numpy as np
+import time
+import math
 import pandas as pd
+import numpy as np
 import requests
 import sqlalchemy
+import mysql.connector
+from datetime import datetime, timedelta, timezone
 from pandas_market_calendars import get_calendar
 
+# Prefer env var (safer in prod); fall back to previous value if not set.
+polygon_api_key = os.getenv("POLYGON_API_KEY", "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3")
 
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3")
-NOTIONAL_VOLUME_THRESHOLD = float(os.getenv("PIT_NOTIONAL_THRESHOLD", "5e7"))
-MAX_PAGES = 20
-MAX_TICKERS_PER_MONTH = int(os.getenv("PIT_MAX_TICKERS", "350"))
-
-USE_DATABASE = os.getenv(
-    "PIT_USE_DATABASE", os.getenv("MTUM_USE_DATABASE", "0")
-).lower() in {"1", "true", "yes", "y"}
-
-DB_ENGINE = sqlalchemy.create_engine(
-    "mysql+mysqlconnector://user:pass@localhost:3306/my_database"
-)
-
-# Optional local CSV fallback when DB access is unavailable
-CSV_FALLBACK_PATH = os.getenv(
-    "PIT_UNIVERSE_CSV", "historical_liquid_tickers.csv"
-)
-PICKLE_FALLBACK_PATH = os.getenv(
-    "PIT_UNIVERSE_PICKLE", "historical_liquid_tickers.pkl"
-)
-FORCE_REBUILD = os.getenv("PIT_FORCE_REBUILD", "false").lower() in {"1", "true", "yes"}
-
+# ---- DB engine ----
+engine = sqlalchemy.create_engine('mysql+mysqlconnector://user:pass@localhost:3306/my_database')
 
 # =============================================================================
-# Trading calendar helpers
+# Calendar utilities
 # =============================================================================
-
 nyse = get_calendar("NYSE")
 
+def trading_days(start_date: str, end_date: str) -> pd.DatetimeIndex:
+    sched = nyse.schedule(start_date=start_date, end_date=end_date)
+    return sched.index.tz_convert("America/New_York")
 
-def _calendar_bound(ts: datetime) -> pd.Timestamp:
-    """Convert arbitrary timestamp to NYSE calendar input (tz-naive New York)."""
+# Build first trading day of each month (rebalance_date = t) and its prior trading day (as_of_date = t-1)
+end_dt = (datetime.now(timezone.utc) - timedelta(days=1)).astimezone()  # yesterday
+start_dt = datetime(2019, 1, 1).astimezone()
+tds = trading_days(start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
 
-    stamp = pd.Timestamp(ts)
-    if stamp.tzinfo is None:
-        return stamp
-    return stamp.tz_convert("America/New_York").tz_localize(None)
+all_dates = pd.DataFrame({"date": pd.to_datetime(tds)})
+all_dates["year"] = all_dates["date"].dt.year
+all_dates["month"] = all_dates["date"].dt.month
+first_of_month_t = (all_dates
+                    .drop_duplicates(subset=["year", "month"], keep="first")
+                    .copy()
+                    .reset_index(drop=True))
+rebalance_dates = first_of_month_t["date"].dt.tz_convert("America/New_York")
+rebalance_dates = rebalance_dates[rebalance_dates > rebalance_dates.min()]  # ensure there is a prior day
 
-
-@lru_cache(maxsize=512)
-def trading_days(start_date: datetime, end_date: datetime) -> pd.DatetimeIndex:
-    """Return NYSE trading days in New York timezone (cached for speed)."""
-
-    schedule = nyse.schedule(
-        start_date=_calendar_bound(start_date),
-        end_date=_calendar_bound(end_date),
-    )
-    index = schedule.index
-    if index.tz is None:
-        index = index.tz_localize("America/New_York")
-    else:
-        index = index.tz_convert("America/New_York")
-    return index
-
-
-today_local = datetime.now(timezone.utc).astimezone()
-start_dt = datetime(2019, 1, 1, tzinfo=today_local.tzinfo)
-tds = trading_days(start_dt, today_local - timedelta(days=1))
-
-td_df = pd.DataFrame({"date": pd.to_datetime(tds)})
-td_df["year"] = td_df["date"].dt.year
-td_df["month"] = td_df["date"].dt.month
-
-first_trading_of_month = (
-    td_df.drop_duplicates(subset=["year", "month"], keep="first")
-    .copy()
-    .reset_index(drop=True)
-)
-rebalance_dates = first_trading_of_month["date"].dt.tz_convert(
-    "America/New_York"
-)
-
-# Align each rebalance date (t) with the previous trading day (t-1)
+# Map each rebalance_date (t) to the previous trading day (t-1)
 td_list = list(tds)
 td_pos = {d: i for i, d in enumerate(td_list)}
 as_of_dates = []
-rebalance_dates_aligned = []
 for t in rebalance_dates:
-    idx = td_pos.get(t)
-    if idx is None or idx == 0:
-        continue
-    rebalance_dates_aligned.append(t)
+    idx = td_pos[t]
+    if idx == 0:
+        continue  # safety
     as_of_dates.append(td_list[idx - 1])
 
-rebalance_frame = pd.DataFrame(
-    {
-        "rebalance_date": pd.to_datetime(rebalance_dates_aligned).tz_convert(
-            "America/New_York"
-        ),
-        "as_of_date": pd.to_datetime(as_of_dates).tz_convert(
-            "America/New_York"
-        ),
-    }
-)
-rebalance_frame["rebalance_date_str"] = rebalance_frame["rebalance_date"].dt.strftime(
-    "%Y-%m-%d"
-)
-rebalance_frame["as_of_date_str"] = rebalance_frame["as_of_date"].dt.strftime(
-    "%Y-%m-%d"
-)
-
+rebalance_frame = pd.DataFrame({
+    "rebalance_date": pd.to_datetime(rebalance_dates[:len(as_of_dates)]).tz_convert("America/New_York"),
+    "as_of_date": pd.to_datetime(as_of_dates).tz_convert("America/New_York"),
+})
+rebalance_frame["rebalance_date_str"] = rebalance_frame["rebalance_date"].dt.strftime("%Y-%m-%d")
+rebalance_frame["as_of_date_str"] = rebalance_frame["as_of_date"].dt.strftime("%Y-%m-%d")
 
 # =============================================================================
-# HTTP session
+# API session
 # =============================================================================
-
 session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(
-    pool_connections=100, pool_maxsize=500, max_retries=3
-)
-session.mount("https://", adapter)
+adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=500, max_retries=3)
+session.mount('https://', adapter)
 session.headers.update({"Accept": "application/json"})
 
-
-_OPTIONS_CACHE: dict[tuple[str, str], float | None] = {}
-
-
-def _get(url: str, params: dict | None = None) -> dict:
-    params = dict(params or {})
-    params["apiKey"] = POLYGON_API_KEY
-    response = session.get(url, params=params, timeout=30)
-    response.raise_for_status()
-    return response.json()
-
-
-def _load_existing_universe() -> pd.DataFrame:
-    """Load previously stored PIT universe rows if present."""
-
-    # Prefer database, then pickle, finally CSV.
-    if USE_DATABASE:
-        try:
-            existing = pd.read_sql(
-                "SELECT as_of_date, rebalance_date, ticker, avg_days_between FROM historical_liquid_tickers_polygon",
-                con=DB_ENGINE,
-            )
-            print("Loaded existing PIT universe from database.")
-            return existing
-        except Exception as exc:  # pragma: no cover - DB guardrail
-            print(
-                f"[WARN] Unable to load universe from MySQL ({exc}). Falling back to local cache..."
-            )
-    else:
-        print(
-            "Skipping MySQL universe load (PIT_USE_DATABASE disabled). Using local cache."
-        )
-
-    if os.path.exists(PICKLE_FALLBACK_PATH):
-        try:
-            existing = pd.read_pickle(PICKLE_FALLBACK_PATH)
-            print(f"Loaded existing PIT universe from {PICKLE_FALLBACK_PATH}.")
-            return existing
-        except Exception as exc:
-            print(f"[WARN] Failed to load pickle fallback ({exc}); trying CSV.")
-
-    if os.path.exists(CSV_FALLBACK_PATH):
-        try:
-            existing = pd.read_csv(
-                CSV_FALLBACK_PATH,
-                usecols=["as_of_date", "rebalance_date", "ticker", "avg_days_between"],
-            )
-            print(f"Loaded existing PIT universe from {CSV_FALLBACK_PATH}.")
-            return existing
-        except Exception as exc:
-            print(f"[WARN] Failed to load CSV fallback ({exc}); proceeding without cache.")
-
-    return pd.DataFrame(columns=["as_of_date", "rebalance_date", "ticker", "avg_days_between"])
-
+def _get(url, params=None):
+    params = params or {}
+    params["apiKey"] = polygon_api_key
+    r = session.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 # =============================================================================
-# Data retrieval helpers
+# Build PIT universe as of t-1 for trade at t
 # =============================================================================
+weekly_ticker_data_list = []
+times = []
 
-def _pit_tickers(as_of: str) -> pd.DataFrame:
-    """Fetch all common stock tickers active as of ``as_of``."""
+# Parameters
+NOTIONAL_VOL_THRESHOLD = 5e7  # $50mm
+MAX_PAGES = 20  # pagination guard
 
-    base_url = "https://api.polygon.io/v3/reference/tickers"
+for _, row in rebalance_frame.iterrows():
+    start_time = datetime.now()
+    as_of = row["as_of_date_str"]
+    reb_t = row["rebalance_date_str"]
+
+    # --- Point-in-time equity list as of t-1 (common stock, active that day) ---
+    # Pagination
+    pit_url = "https://api.polygon.io/v3/reference/tickers"
     params = {
         "date": as_of,
         "type": "CS",
@@ -215,226 +111,110 @@ def _pit_tickers(as_of: str) -> pd.DataFrame:
         "sort": "ticker",
     }
 
-    frames: list[pd.DataFrame] = []
-    next_url: str | None = base_url
+    pit_data_pages = []
+    next_url = pit_url
+    seen = 0
     for _ in range(MAX_PAGES):
+        if next_url == pit_url:
+            payload = _get(pit_url, params=params)
+        else:
+            payload = _get(next_url)
+        results = payload.get("results", [])
+        if not results:
+            break
+        pit_data_pages.append(pd.json_normalize(results))
+        next_url = payload.get("next_url")
         if not next_url:
             break
-        payload = _get(next_url, params=params if next_url == base_url else None)
-        results = payload.get("results", [])
-        if results:
-            frames.append(pd.json_normalize(results))
-        next_url = payload.get("next_url")
+        seen += 1
+        if seen >= MAX_PAGES:
+            break
 
-    if not frames:
-        return pd.DataFrame(columns=["ticker"])
+    if not pit_data_pages:
+        continue
+    tickers_on_as_of = pd.concat(pit_data_pages, ignore_index=True)
+    assert tickers_on_as_of.shape[0] > 0, "No PIT tickers retrieved"
 
-    data = pd.concat(frames, ignore_index=True)
-    return data
-
-
-def _liquid_equities(as_of: str, tickers: pd.DataFrame) -> pd.DataFrame:
-    """Filter tickers by notional volume using grouped EOD aggregates."""
-
-    grouped = _get(
-        f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{as_of}",
-        params={"adjusted": "true"},
-    )
-    grouped_df = pd.json_normalize(grouped.get("results", [])).rename(columns={"T": "ticker"})
+    # --- Liquidity screen using grouped market summary on t-1 (EOD) ---
+    grouped = _get(f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{as_of}",
+                   params={"adjusted": "true"})
+    grouped_df = pd.json_normalize(grouped.get("results", []))
     if grouped_df.empty:
-        return pd.DataFrame(columns=["ticker"])
-
-    grouped_df["date"] = (
-        pd.to_datetime(grouped_df["t"], unit="ms", utc=True)
-        .dt.tz_convert("America/New_York")
-        .dt.strftime("%Y-%m-%d")
-    )
+        continue
+    grouped_df = grouped_df.rename(columns={"T": "ticker"})
+    grouped_df["date"] = pd.to_datetime(grouped_df["t"], unit="ms", utc=True)\
+                               .dt.tz_convert("America/New_York")\
+                               .dt.strftime("%Y-%m-%d")
+    # notional = VWAP * shares traded
     grouped_df["notional_volume"] = grouped_df["vw"] * grouped_df["v"]
 
     merged = pd.merge(
         grouped_df[["date", "c", "notional_volume", "ticker"]],
-        tickers[["ticker", "name"]],
+        tickers_on_as_of[["ticker", "name"]],
         on="ticker",
-        how="inner",
+        how="inner"
     )
+    liquid = merged.loc[merged["notional_volume"] >= NOTIONAL_VOL_THRESHOLD]\
+                   .copy()\
+                   .sort_values("notional_volume", ascending=False)
 
-    liquid = (
-        merged.loc[merged["notional_volume"] >= NOTIONAL_VOLUME_THRESHOLD]
-        .copy()
-        .sort_values("notional_volume", ascending=False)
-    )
-    if MAX_TICKERS_PER_MONTH > 0:
-        liquid = liquid.nlargest(MAX_TICKERS_PER_MONTH, "notional_volume")
-    return liquid[["date", "ticker"]].drop_duplicates()
-
-
-def _has_weekly_options(ticker: str, as_of: str) -> float | None:
-    """Return the average spacing (in days) between the first five expiries if ticker has weekly options."""
-
-    cache_key = (ticker, as_of)
-    if cache_key in _OPTIONS_CACHE:
-        return _OPTIONS_CACHE[cache_key]
-
-    contracts = _get(
-        "https://api.polygon.io/v3/reference/options/contracts",
-        params={"underlying_ticker": ticker, "as_of": as_of, "limit": 1000},
-    )
-    contract_df = pd.json_normalize(contracts.get("results", []))
-    if contract_df.empty or "expiration_date" not in contract_df:
-        return None
-
-    expirations = np.sort(pd.to_datetime(contract_df["expiration_date"]).dropna().unique())
-    if len(expirations) < 5:
-        return None
-
-    exp_df = pd.DataFrame({"date": pd.to_datetime(expirations[:5])})
-    exp_df["days_between"] = exp_df["date"].diff().dt.days
-    avg_gap = exp_df["days_between"].iloc[1:5].mean()
-    if math.isnan(avg_gap) or avg_gap >= 9:
-        avg_gap_value: float | None = None
-    else:
-        avg_gap_value = float(avg_gap)
-
-    _OPTIONS_CACHE[cache_key] = avg_gap_value
-    return avg_gap_value
-
-
-# =============================================================================
-# Universe construction
-# =============================================================================
-
-existing_universe = _load_existing_universe()
-existing_universe = existing_universe.drop_duplicates(
-    subset=["as_of_date", "rebalance_date", "ticker"], keep="last"
-)
-
-skip_keys = set()
-existing_months = set()
-if not FORCE_REBUILD and not existing_universe.empty:
-    skip_keys = {
-        (
-            pd.Timestamp(row.as_of_date).strftime("%Y-%m-%d"),
-            pd.Timestamp(row.rebalance_date).strftime("%Y-%m-%d"),
-            row.ticker,
-        )
-        for row in existing_universe.itertuples(index=False)
-    }
-    existing_months = {key[:2] for key in skip_keys}
-
-rows: list[pd.DataFrame] = []
-
-for row in rebalance_frame.itertuples(index=False):
-    as_of = row.as_of_date_str
-    rebalance = row.rebalance_date_str
-
-    if not FORCE_REBUILD and (as_of, rebalance) in existing_months:
-        # Month already present in cache, skip expensive re-fetch.
+    tickers = liquid["ticker"].drop_duplicates().to_numpy()
+    if len(tickers) == 0:
         continue
 
-    pit_tickers = _pit_tickers(as_of)
-    if pit_tickers.empty:
-        continue
-
-    liquid = _liquid_equities(as_of, pit_tickers)
-    if liquid.empty:
-        continue
-
-    unique_tickers = liquid["ticker"].drop_duplicates()
-    for ticker in unique_tickers:
-        cache_key = (as_of, rebalance, ticker)
-        if not FORCE_REBUILD and cache_key in skip_keys:
-            continue
+    # --- Options weekly expiration check (as of t-1) ---
+    for tk in tickers:
         try:
-            avg_gap = _has_weekly_options(ticker, as_of)
-        except Exception as exc:  # pragma: no cover - network guardrail
-            print(f"[WARN] Failed options lookup for {ticker} @ {as_of}: {exc}")
+            # Using as_of for strict PIT; we don't rely on same-day discovery at t.
+            # Note: Including both calls & puts; expiration_date dedup handles overlap.
+            contracts = _get("https://api.polygon.io/v3/reference/options/contracts",
+                             params={"underlying_ticker": tk, "as_of": as_of, "limit": 1000})
+            res = pd.json_normalize(contracts.get("results", []))
+            if res.empty or "expiration_date" not in res.columns:
+                continue
+
+            exps = np.sort(pd.to_datetime(res["expiration_date"]).unique())
+            if len(exps) < 5:
+                continue
+            # compute average spacing between first 5 expirations
+            d = pd.DataFrame({"date": pd.to_datetime(exps[:5])})
+            d["days_between"] = d["date"].diff().dt.days
+            avg_gap = d["days_between"].iloc[1:5].mean()
+            if math.isnan(avg_gap) or avg_gap >= 9:
+                continue  # not a weekly chain
+
+            weekly_ticker_data_list.append(pd.DataFrame([{
+                "as_of_date": as_of,
+                "rebalance_date": reb_t,
+                "ticker": tk,
+                "avg_days_between": float(avg_gap),
+            }]))
+        except Exception as e:
+            # Keep going; a single symbol failure shouldn't stop universe formation
+            print(f"[WARN] {tk} @ {as_of}: {e}")
             continue
-        if avg_gap is None:
-            continue
-        rows.append(
-            pd.DataFrame(
-                {
-                    "as_of_date": [as_of],
-                    "rebalance_date": [rebalance],
-                    "ticker": [ticker],
-                    "avg_days_between": [avg_gap],
-                }
-            )
-        )
 
+    # progress report
+    dt = datetime.now() - start_time
+    times.append(dt.total_seconds())
+    pct = round((rebalance_frame.index.get_loc(_) / len(rebalance_frame)) * 100, 2)
+    avg = np.mean(times)
+    remaining = len(rebalance_frame) - rebalance_frame.index.get_loc(_)
+    print(f"{pct}% complete | avg {avg:.1f}s/it | est ~{avg*remaining/60:.1f} min left")
 
-if rows:
-    new_universe = (
-        pd.concat(rows, ignore_index=True)
-        .drop_duplicates(subset=["as_of_date", "rebalance_date", "ticker"], keep="last")
-    )
-else:
-    new_universe = pd.DataFrame(columns=["as_of_date", "rebalance_date", "ticker", "avg_days_between"])
-    if not existing_universe.empty:
-        print("No new rebalance months detected; reusing cached universe.")
-
-if existing_universe.empty:
-    universe = new_universe
-else:
-    universe = pd.concat([existing_universe, new_universe], ignore_index=True)
-    universe = universe.drop_duplicates(
+# =============================================================================
+# Final storage
+# =============================================================================
+if weekly_ticker_data_list:
+    weekly_universe = pd.concat(weekly_ticker_data_list, ignore_index=True).drop_duplicates(
         subset=["as_of_date", "rebalance_date", "ticker"], keep="last"
     )
 
-if universe.empty:
-    raise RuntimeError("No securities passed the PIT weekly options filters.")
+    # Sanity checks
+    assert {"as_of_date", "rebalance_date", "ticker"}.issubset(weekly_universe.columns)
+    assert weekly_universe[["as_of_date", "rebalance_date", "ticker"]].isna().sum().sum() == 0
+    print("Weekly universe shape:", weekly_universe.shape)
 
-new_rows_to_persist = new_universe
-
-required_cols = ["as_of_date", "rebalance_date", "ticker", "avg_days_between"]
-if sorted(universe.columns.tolist()) != sorted(required_cols):
-    raise AssertionError(f"Unexpected columns: {universe.columns.tolist()}")
-
-if universe[required_cols].isna().sum().sum() != 0:
-    raise AssertionError("Null values detected in the PIT universe.")
-
-print("Weekly universe shape:", universe.shape)
-
-
-def _persist_to_db(df: pd.DataFrame) -> None:
-    if df.empty:
-        return
-    try:
-        df.to_sql(
-            "historical_liquid_tickers_polygon",
-            con=DB_ENGINE,
-            if_exists="append",
-            index=False,
-            method="multi",
-        )
-        print(
-            "Universe written to database table 'historical_liquid_tickers_polygon'."
-        )
-    except Exception as exc:  # pragma: no cover - db guardrail
-        print(f"[WARN] Failed to write universe to DB: {exc}")
-
-
-def _persist_to_csv(df: pd.DataFrame, path: str) -> None:
-    if df.empty:
-        return
-    try:
-        df.to_csv(path, index=False)
-        print(f"Universe cached to CSV at {path}.")
-    except Exception as exc:  # pragma: no cover - file guardrail
-        print(f"[WARN] Failed to write universe CSV: {exc}")
-
-
-def _persist_to_pickle(df: pd.DataFrame, path: str) -> None:
-    if df.empty:
-        return
-    try:
-        df.to_pickle(path)
-        print(f"Universe cached to pickle at {path}.")
-    except Exception as exc:  # pragma: no cover - file guardrail
-        print(f"[WARN] Failed to write universe pickle: {exc}")
-
-
-_persist_to_db(new_rows_to_persist)
-_persist_to_csv(universe, CSV_FALLBACK_PATH)
-_persist_to_pickle(universe, PICKLE_FALLBACK_PATH)
-
+    weekly_universe.to_sql("historical_liquid_tickers_polygon", con=engine, if_exists="append", index=False, method="multi")
+else:
+    print("No symbols passed filters. Nothing to write.")
