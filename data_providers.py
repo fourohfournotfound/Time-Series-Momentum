@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Data provider clients for historical daily bars.
 
 This module provides lightweight wrappers around the Polygon.io and
@@ -56,7 +57,7 @@ class BaseDataClient:
 
 
 class PolygonAggsClient(BaseDataClient):
-    """Client for Polygon.io aggregate (daily) data."""
+    """Client for Polygon.io aggregate (daily) data (adjusted)."""
 
     base_url = "https://api.polygon.io"
 
@@ -67,16 +68,12 @@ class PolygonAggsClient(BaseDataClient):
         self.api_key = api_key
 
     def get_daily_bars(self, ticker: str, start: str, end: str) -> pd.DataFrame:
-        """Fetch adjusted daily aggregates for ``ticker``.
+        """Fetch adjusted daily aggregates for ``ticker`` within [start, end].
 
-        Parameters
-        ----------
-        ticker
-            Symbol to request.
-        start, end
-            Inclusive date range in ``YYYY-mm-dd`` format.
+        Returns a DataFrame with columns:
+        ['t','timestamp','date','ticker','o','h','l','c','v','vw','n']
+        where 'date' is in America/New_York and unique per trading day.
         """
-
         url = f"{self.base_url}/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
         params: Dict[str, str] = {
             "adjusted": "true",
@@ -101,7 +98,7 @@ class PolygonAggsClient(BaseDataClient):
 
 
 class AlpacaBarsClient(BaseDataClient):
-    """Client for Alpaca Markets historical daily bars."""
+    """Client for Alpaca Markets historical daily bars (adjusted)."""
 
     base_url = "https://data.alpaca.markets/v2"
 
@@ -164,4 +161,3 @@ class AlpacaBarsClient(BaseDataClient):
         frame["ticker"] = ticker
         cols = ["t", "timestamp", "date", "ticker", "o", "h", "l", "c", "v", "vw", "n"]
         return frame[cols].sort_values("timestamp").reset_index(drop=True)
-
