@@ -48,6 +48,53 @@ def _get(url: str, params: dict | None = None) -> dict:
     return response.json()
 
 
+def _ensure_universe_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardise PIT universe columns for backwards compatibility."""
+
+    df = df.copy()
+    drop_candidates = [c for c in df.columns if c.startswith("Unnamed")] + ["index"]
+    df = df.drop(columns=[c for c in drop_candidates if c in df.columns], errors="ignore")
+
+    if "rebalance_date" not in df.columns and "date" in df.columns:
+        df = df.rename(columns={"date": "rebalance_date"})
+
+    if "ticker" not in df.columns:
+        raise AssertionError("Universe missing required column: 'ticker'")
+
+    def _to_ny(ts: pd.Timestamp) -> pd.Timestamp:
+        ts = pd.Timestamp(ts)
+        if ts.tzinfo is None:
+            return ts.tz_localize("America/New_York")
+        return ts.tz_convert("America/New_York")
+
+    def _previous_trading_day(ts: pd.Timestamp) -> pd.Timestamp:
+        window = trading_days(ts - timedelta(days=7), ts)
+        past = window[window < ts]
+        if len(past) == 0:
+            raise RuntimeError(f"No prior trading day found for {ts}")
+        return past.max()
+
+    if "rebalance_date" not in df.columns:
+        raise AssertionError("Universe missing required column: 'rebalance_date'")
+
+    df["rebalance_date"] = pd.to_datetime(df["rebalance_date"])
+
+    if "as_of_date" not in df.columns:
+        df["as_of_date"] = df["rebalance_date"].apply(
+            lambda x: _previous_trading_day(_to_ny(x)).tz_localize(None)
+        )
+    else:
+        df["as_of_date"] = pd.to_datetime(df["as_of_date"])
+
+    required_cols = {"as_of_date", "rebalance_date", "ticker"}
+    if not required_cols.issubset(df.columns):
+        raise AssertionError(
+            f"Universe missing required columns: {required_cols - set(df.columns)}"
+        )
+
+    return df
+
+
 def _load_universe() -> pd.DataFrame:
     """Load the PIT universe, preferring MySQL but falling back to CSV."""
 
@@ -63,11 +110,7 @@ def _load_universe() -> pd.DataFrame:
         df = pd.read_csv(CSV_FALLBACK_PATH)
         print(f"Loaded PIT universe from CSV fallback at {CSV_FALLBACK_PATH}.")
 
-    required_cols = {"as_of_date", "rebalance_date", "ticker"}
-    if not required_cols.issubset(df.columns):
-        raise AssertionError(
-            f"Universe missing required columns: {required_cols - set(df.columns)}"
-        )
+    df = _ensure_universe_schema(df)
 
     return df.drop_duplicates(subset=["as_of_date", "rebalance_date", "ticker"], keep="last")
 
