@@ -19,7 +19,7 @@ import mysql.connector
 from datetime import datetime, timedelta
 from pandas_market_calendars import get_calendar
 
-from custom_relative_market_features import (
+from relative_market_features import (
     add_entropy_info_features, ewm_moments, latest_per_ticker
 )
 
