@@ -31,6 +31,7 @@ from pandas_market_calendars import get_calendar
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3")
 NOTIONAL_VOLUME_THRESHOLD = float(os.getenv("PIT_NOTIONAL_THRESHOLD", "5e7"))
 MAX_PAGES = 20
+MAX_TICKERS_PER_MONTH = int(os.getenv("PIT_MAX_TICKERS", "350"))
 
 DB_ENGINE = sqlalchemy.create_engine(
     "mysql+mysqlconnector://user:pass@localhost:3306/my_database"
@@ -125,9 +126,14 @@ rebalance_frame["as_of_date_str"] = rebalance_frame["as_of_date"].dt.strftime(
 # =============================================================================
 
 session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=500, max_retries=3)
+adapter = requests.adapters.HTTPAdapter(
+    pool_connections=100, pool_maxsize=500, max_retries=3
+)
 session.mount("https://", adapter)
 session.headers.update({"Accept": "application/json"})
+
+
+_OPTIONS_CACHE: dict[tuple[str, str], float | None] = {}
 
 
 def _get(url: str, params: dict | None = None) -> dict:
@@ -204,11 +210,17 @@ def _liquid_equities(as_of: str, tickers: pd.DataFrame) -> pd.DataFrame:
         .copy()
         .sort_values("notional_volume", ascending=False)
     )
+    if MAX_TICKERS_PER_MONTH > 0:
+        liquid = liquid.nlargest(MAX_TICKERS_PER_MONTH, "notional_volume")
     return liquid[["date", "ticker"]].drop_duplicates()
 
 
 def _has_weekly_options(ticker: str, as_of: str) -> float | None:
     """Return the average spacing (in days) between the first five expiries if ticker has weekly options."""
+
+    cache_key = (ticker, as_of)
+    if cache_key in _OPTIONS_CACHE:
+        return _OPTIONS_CACHE[cache_key]
 
     contracts = _get(
         "https://api.polygon.io/v3/reference/options/contracts",
@@ -226,8 +238,12 @@ def _has_weekly_options(ticker: str, as_of: str) -> float | None:
     exp_df["days_between"] = exp_df["date"].diff().dt.days
     avg_gap = exp_df["days_between"].iloc[1:5].mean()
     if math.isnan(avg_gap) or avg_gap >= 9:
-        return None
-    return float(avg_gap)
+        avg_gap_value: float | None = None
+    else:
+        avg_gap_value = float(avg_gap)
+
+    _OPTIONS_CACHE[cache_key] = avg_gap_value
+    return avg_gap_value
 
 
 # =============================================================================

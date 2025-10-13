@@ -38,6 +38,13 @@ CSV_FALLBACK_PATH = os.getenv("PIT_UNIVERSE_CSV", "historical_liquid_tickers.csv
 
 nyse = get_calendar("NYSE")
 
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(
+    pool_connections=100, pool_maxsize=500, max_retries=3
+)
+session.mount("https://", adapter)
+session.headers.update({"Accept": "application/json"})
+
 
 def _calendar_bound(ts: datetime) -> pd.Timestamp:
     """Convert arbitrary timestamp to NYSE calendar input (tz-naive New York)."""
@@ -72,7 +79,7 @@ def next_trading_day(ts: pd.Timestamp) -> pd.Timestamp:
 def _get(url: str, params: dict | None = None) -> dict:
     params = dict(params or {})
     params["apiKey"] = POLYGON_API_KEY
-    response = requests.get(url, params=params, timeout=30)
+    response = session.get(url, params=params, timeout=30)
     response.raise_for_status()
     return response.json()
 
@@ -131,6 +138,7 @@ def _ensure_universe_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _load_universe() -> pd.DataFrame:
+    loaded_from_csv = False
     try:
         df = pd.read_sql("SELECT * FROM historical_liquid_tickers_polygon", con=DB_ENGINE)
         print("Loaded PIT universe from MySQL database.")
@@ -142,8 +150,16 @@ def _load_universe() -> pd.DataFrame:
             ) from exc
         df = pd.read_csv(CSV_FALLBACK_PATH)
         print(f"Loaded PIT universe from CSV fallback at {CSV_FALLBACK_PATH}.")
+        loaded_from_csv = True
 
     df = _ensure_universe_schema(df)
+
+    if loaded_from_csv:
+        try:
+            df.to_csv(CSV_FALLBACK_PATH, index=False)
+            print("Normalised PIT universe cached back to CSV with latest schema.")
+        except Exception as cache_exc:  # pragma: no cover - file guardrail
+            print(f"[WARN] Failed to refresh PIT universe CSV: {cache_exc}")
 
     df["as_of_date"] = pd.to_datetime(df["as_of_date"])
     df["rebalance_date"] = pd.to_datetime(df["rebalance_date"])
@@ -170,44 +186,93 @@ if months.size < 2:
 # Data helpers
 # =============================================================================
 
-SPY_HISTORY = _get(
-    f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2017-01-01/{end_backtest.strftime('%Y-%m-%d')}",
-    params={"adjusted": "true", "sort": "asc", "limit": 50000},
-)
-SPY = pd.json_normalize(SPY_HISTORY.get("results", [])).set_index("t")
-SPY.index = pd.to_datetime(SPY.index, unit="ms", utc=True).tz_convert("America/New_York")
-SPY["date"] = SPY.index.strftime("%Y-%m-%d")
+HISTORY_START = os.getenv("MTUM_HISTORY_START", "2016-01-01")
+_history_end_env = os.getenv("MTUM_HISTORY_END")
+if _history_end_env:
+    HISTORY_END = _history_end_env
+else:
+    _last_month = pd.Timestamp(months[-1])
+    _history_end_dt = next_trading_day(_last_month)
+    if _history_end_dt.tzinfo is not None:
+        _history_end_dt = _history_end_dt.tz_convert("America/New_York").tz_localize(None)
+    else:
+        _history_end_dt = pd.Timestamp(_history_end_dt)
+    HISTORY_END = (_history_end_dt + timedelta(days=7)).strftime("%Y-%m-%d")
+
+PRICE_CACHE: dict[str, pd.DataFrame] = {}
+FORWARD_RETURN_CACHE: dict[tuple[str, str, str], float] = {}
+FEATURE_CACHE: dict[tuple[str, str], dict] = {}
+
+
+def _price_history(ticker: str) -> pd.DataFrame:
+    key = ticker.upper()
+    cached = PRICE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    resp = _get(
+        f"https://api.polygon.io/v2/aggs/ticker/{key}/range/1/day/{HISTORY_START}/{HISTORY_END}",
+        params={"adjusted": "true", "sort": "asc", "limit": 50000},
+    )
+    raw = pd.json_normalize(resp.get("results", []))
+    if raw.empty:
+        df = pd.DataFrame(columns=["o", "c", "h", "l", "v", "vw"])
+    else:
+        raw = raw.drop_duplicates(subset=["t"], keep="last")
+        timestamps = pd.to_datetime(raw["t"], unit="ms", utc=True).tz_convert(
+            "America/New_York"
+        )
+        raw["date"] = timestamps.tz_localize(None).normalize()
+        df = (
+            raw.dropna(subset=["date"])
+            .drop_duplicates(subset=["date"], keep="last")
+            .set_index("date")[["o", "c", "h", "l", "v", "vw"]]
+        )
+        df.index = pd.to_datetime(df.index)
+        df.sort_index(inplace=True)
+
+    PRICE_CACHE[key] = df
+    return df
+
+
+SPY = _price_history("SPY")
+if SPY.empty:
+    raise RuntimeError("Unable to load SPY history for benchmarking.")
 
 
 def compute_features(ticker: str, as_of_date: pd.Timestamp) -> dict:
-    start_date = (as_of_date - timedelta(days=365 + 60)).strftime("%Y-%m-%d")
-    as_of_str = as_of_date.strftime("%Y-%m-%d")
+    cache_key = (ticker, pd.Timestamp(as_of_date).strftime("%Y-%m-%d"))
+    if cache_key in FEATURE_CACHE:
+        return FEATURE_CACHE[cache_key]
 
-    resp = _get(
-        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{as_of_str}",
-        params={"adjusted": "true", "sort": "asc", "limit": 50000},
-    )
-    df = pd.json_normalize(resp.get("results", [])).set_index("t")
-    if df.empty:
+    history = _price_history(ticker)
+    if history.empty:
+        FEATURE_CACHE[cache_key] = {}
         return {}
 
-    df.index = pd.to_datetime(df.index, unit="ms", utc=True).tz_convert("America/New_York")
-    df["date"] = df.index.strftime("%Y-%m-%d")
-
-    skip_cutoff = (as_of_date - timedelta(days=30)).strftime("%Y-%m-%d")
-    window = df[df["date"] < skip_cutoff].tail(252).copy()
-    if len(window) < 252:
+    as_of_date = pd.Timestamp(as_of_date)
+    history = history.loc[history.index <= as_of_date]
+    if history.empty:
+        FEATURE_CACHE[cache_key] = {}
         return {}
 
-    spy_slice = SPY[SPY["date"] <= skip_cutoff][["c", "date"]]
-    merged = pd.merge(
-        spy_slice,
-        window[["c", "date"]],
-        on="date",
-        how="inner",
-        suffixes=("_m", "_s"),
+    skip_cutoff = as_of_date - timedelta(days=30)
+    window = history.loc[history.index < skip_cutoff].tail(252).copy()
+    if window.shape[0] < 252:
+        FEATURE_CACHE[cache_key] = {}
+        return {}
+
+    spy_window = SPY.loc[SPY.index <= skip_cutoff][["c"]]
+    spy_window = spy_window.loc[spy_window.index >= window.index.min()].copy()
+    if spy_window.empty:
+        FEATURE_CACHE[cache_key] = {}
+        return {}
+
+    merged = spy_window.rename(columns={"c": "c_m"}).join(
+        window[["c"]].rename(columns={"c": "c_s"}), how="inner"
     )
     if merged.shape[0] < 200:
+        FEATURE_CACHE[cache_key] = {}
         return {}
 
     merged["ret_m"] = merged["c_m"].pct_change().fillna(0.0)
@@ -229,44 +294,64 @@ def compute_features(ticker: str, as_of_date: pd.Timestamp) -> dict:
     sigma_ann = merged["ret_s"].std() * np.sqrt(252)
     vol_scaled = mom_12_1 / (sigma_ann + 1e-8)
 
-    return {
+    result = {
         "beta_capm": float(beta),
         "mom_12_1": float(mom_12_1),
         "resid_mom": float(resid_mom) if np.isfinite(resid_mom) else np.nan,
         "sigma_ann": float(sigma_ann),
         "mom_vol_scaled": float(vol_scaled),
     }
+    FEATURE_CACHE[cache_key] = result
+    return result
 
 
 def forward_open_to_open(ticker: str, entry_rebalance: pd.Timestamp, exit_rebalance: pd.Timestamp) -> float:
-    entry_trade_day = next_trading_day(entry_rebalance)
-    exit_trade_day = next_trading_day(exit_rebalance)
+    entry_rebalance = pd.Timestamp(entry_rebalance)
+    exit_rebalance = pd.Timestamp(exit_rebalance)
 
-    start = (entry_trade_day - timedelta(days=5)).strftime("%Y-%m-%d")
-    end = (exit_trade_day + timedelta(days=5)).strftime("%Y-%m-%d")
-
-    resp = _get(
-        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}",
-        params={"adjusted": "true", "sort": "asc", "limit": 50000},
+    cache_key = (
+        ticker,
+        entry_rebalance.strftime("%Y-%m-%d"),
+        exit_rebalance.strftime("%Y-%m-%d"),
     )
-    df = pd.json_normalize(resp.get("results", [])).set_index("t")
-    if df.empty:
+    if cache_key in FORWARD_RETURN_CACHE:
+        return FORWARD_RETURN_CACHE[cache_key]
+
+    history = _price_history(ticker)
+    if history.empty:
+        FORWARD_RETURN_CACHE[cache_key] = np.nan
         return np.nan
 
-    df.index = pd.to_datetime(df.index, unit="ms", utc=True).tz_convert("America/New_York")
-    df["date"] = df.index.strftime("%Y-%m-%d")
+    def _to_ny(ts: pd.Timestamp) -> pd.Timestamp:
+        ts = pd.Timestamp(ts)
+        if ts.tzinfo is None:
+            return ts.tz_localize("America/New_York")
+        return ts.tz_convert("America/New_York")
+
+    def _normalize(ts: pd.Timestamp) -> pd.Timestamp:
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("America/New_York").tz_localize(None)
+        return ts.normalize()
+
+    entry_trade_day = _normalize(next_trading_day(_to_ny(entry_rebalance)))
+    exit_trade_day = _normalize(next_trading_day(_to_ny(exit_rebalance)))
+    entry_rebalance_day = _normalize(_to_ny(entry_rebalance))
+    exit_rebalance_day = _normalize(_to_ny(exit_rebalance))
 
     try:
-        price_entry = df.loc[df["date"] == entry_trade_day.strftime("%Y-%m-%d"), "o"].iloc[0]
-        price_exit = df.loc[df["date"] == exit_trade_day.strftime("%Y-%m-%d"), "o"].iloc[0]
-    except Exception:
+        price_entry = float(history.at[entry_trade_day, "o"])
+        price_exit = float(history.at[exit_trade_day, "o"])
+    except KeyError:
         try:
-            price_entry = df.loc[df["date"] == entry_rebalance.strftime("%Y-%m-%d"), "c"].iloc[0]
-            price_exit = df.loc[df["date"] == exit_rebalance.strftime("%Y-%m-%d"), "c"].iloc[0]
-        except Exception:
+            price_entry = float(history.at[entry_rebalance_day, "c"])
+            price_exit = float(history.at[exit_rebalance_day, "c"])
+        except KeyError:
+            FORWARD_RETURN_CACHE[cache_key] = np.nan
             return np.nan
 
-    return float((price_exit / price_entry) - 1.0) * 100.0
+    forward_return = float((price_exit / price_entry) - 1.0) * 100.0
+    FORWARD_RETURN_CACHE[cache_key] = forward_return
+    return forward_return
 
 
 # =============================================================================
@@ -276,16 +361,17 @@ def forward_open_to_open(ticker: str, entry_rebalance: pd.Timestamp, exit_rebala
 feature_panels: list[pd.DataFrame] = []
 monthly_returns: list[dict] = []
 
-for month in months[:-1]:
-    next_month_idx = np.where(months > month)[0]
+for month_value in months[:-1]:
+    month_ts = pd.Timestamp(month_value)
+    next_month_idx = np.where(months > month_value)[0]
     if len(next_month_idx) == 0:
         break
-    next_month = months[next_month_idx[0]]
+    next_month_ts = pd.Timestamp(months[next_month_idx[0]])
 
-    month_universe = universe[universe["rebalance_date"] == month]
+    month_universe = universe[universe["rebalance_date"] == month_ts]
     if month_universe.empty:
         continue
-    as_of_date = month_universe["as_of_date"].iloc[0]
+    as_of_date = pd.Timestamp(month_universe["as_of_date"].iloc[0])
 
     feature_rows = []
     for ticker in month_universe["ticker"].drop_duplicates():
@@ -294,7 +380,7 @@ for month in months[:-1]:
             continue
         feature_rows.append(
             {
-                "entry_date": month.strftime("%Y-%m-%d"),
+                "entry_date": month_ts.strftime("%Y-%m-%d"),
                 "as_of_date": as_of_date.strftime("%Y-%m-%d"),
                 "ticker": ticker,
                 **feats,
@@ -316,12 +402,12 @@ for month in months[:-1]:
     top_decile = feature_df.groupby(level=0).head(10).reset_index()
     bottom_decile = feature_df.groupby(level=0).tail(10).reset_index()
 
-    spy_forward = forward_open_to_open("SPY", month, next_month)
+    spy_forward = forward_open_to_open("SPY", month_ts, next_month_ts)
     forward_rows = []
 
     for side, data in (("long", top_decile), ("short", bottom_decile)):
         for _, row in data.iterrows():
-            fwd = forward_open_to_open(row["ticker"], month, next_month)
+            fwd = forward_open_to_open(row["ticker"], month_ts, next_month_ts)
             if np.isnan(fwd):
                 continue
             beta = feature_df.loc[(row["entry_date"], row["ticker"]), "beta_capm"]
@@ -345,7 +431,7 @@ for month in months[:-1]:
 
     monthly_returns.append(
         {
-            "date": month.strftime("%Y-%m-%d"),
+            "date": month_ts.strftime("%Y-%m-%d"),
             "long": long_mean,
             "short": short_mean,
         }

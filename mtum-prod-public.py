@@ -34,6 +34,13 @@ CSV_FALLBACK_PATH = os.getenv("PIT_UNIVERSE_CSV", "historical_liquid_tickers.csv
 
 nyse = get_calendar("NYSE")
 
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(
+    pool_connections=100, pool_maxsize=500, max_retries=3
+)
+session.mount("https://", adapter)
+session.headers.update({"Accept": "application/json"})
+
 
 def _calendar_bound(ts: datetime) -> pd.Timestamp:
     """Convert arbitrary timestamp to NYSE calendar input (tz-naive New York)."""
@@ -60,7 +67,7 @@ def trading_days(start_date: datetime, end_date: datetime) -> pd.DatetimeIndex:
 def _get(url: str, params: dict | None = None) -> dict:
     params = dict(params or {})
     params["apiKey"] = POLYGON_API_KEY
-    response = requests.get(url, params=params, timeout=30)
+    response = session.get(url, params=params, timeout=30)
     response.raise_for_status()
     return response.json()
 
@@ -115,6 +122,7 @@ def _ensure_universe_schema(df: pd.DataFrame) -> pd.DataFrame:
 def _load_universe() -> pd.DataFrame:
     """Load the PIT universe, preferring MySQL but falling back to CSV."""
 
+    loaded_from_csv = False
     try:
         df = pd.read_sql("SELECT * FROM historical_liquid_tickers_polygon", con=DB_ENGINE)
         print("Loaded PIT universe from MySQL database.")
@@ -126,8 +134,16 @@ def _load_universe() -> pd.DataFrame:
             ) from exc
         df = pd.read_csv(CSV_FALLBACK_PATH)
         print(f"Loaded PIT universe from CSV fallback at {CSV_FALLBACK_PATH}.")
+        loaded_from_csv = True
 
     df = _ensure_universe_schema(df)
+
+    if loaded_from_csv:
+        try:
+            df.to_csv(CSV_FALLBACK_PATH, index=False)
+            print("Normalised PIT universe cached back to CSV with latest schema.")
+        except Exception as cache_exc:  # pragma: no cover - file guardrail
+            print(f"[WARN] Failed to refresh PIT universe CSV: {cache_exc}")
 
     return df.drop_duplicates(subset=["as_of_date", "rebalance_date", "ticker"], keep="last")
 
