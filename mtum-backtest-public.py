@@ -417,6 +417,10 @@ def main():
     print("L-S:",   {k: (round(v,4) if isinstance(v,float) else v) for k,v in metrics_ls.items()})
     print(f"Turnover TopDecile ~ {round(turnover_top,4)} | Turnover BottomDecile ~ {round(turnover_bot,4)}")
 
+    # Ensure output directory exists for plots and tabular outputs
+    outdir = pathlib.Path(args.output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
     # ---------- Plots ----------
     PLOT_FIGSIZE = (10, 6)
 
@@ -424,35 +428,52 @@ def main():
     cum_short = (1 + (returns["short"]/100.0)).cumprod() - 1
     cum_ls    = (1 + (returns["ls"]/100.0)).cumprod() - 1
 
-    plt.figure(figsize=PLOT_FIGSIZE, dpi=200)
-    plt.title("Cumulative Returns (Gross)")
-    plt.plot(cum_long.index, cum_long.values)
-    plt.plot(cum_short.index, cum_short.values)
-    plt.plot(cum_ls.index, cum_ls.values)
-    plt.legend(["Top Decile", "Bottom Decile", "Long-Short"])
-    plt.xlabel("Date"); plt.ylabel("Cumulative Return")
-    plt.xticks(rotation=45); plt.tight_layout(); plt.show(); plt.close()
+    fig, ax = plt.subplots(figsize=PLOT_FIGSIZE, dpi=200)
+    ax.set_title("Cumulative Returns (Gross)")
+    ax.plot(cum_long.index, cum_long.values)
+    ax.plot(cum_short.index, cum_short.values)
+    ax.plot(cum_ls.index, cum_ls.values)
+    ax.legend(["Top Decile", "Bottom Decile", "Long-Short"])
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Cumulative Return")
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    cum_returns_path = outdir / "cumulative_returns.png"
+    fig.savefig(cum_returns_path, bbox_inches="tight")
+    print(f"Saved plot: {cum_returns_path}")
+    plt.close(fig)
 
     # Drawdown of L-S
     cum = (1 + (returns["ls"]/100.0)).cumprod()
     dd = cum / cum.cummax() - 1.0
-    plt.figure(figsize=PLOT_FIGSIZE, dpi=200)
-    plt.title("Drawdown (Long-Short)")
-    plt.plot(dd.index, dd.values)
-    plt.xlabel("Date"); plt.ylabel("Drawdown")
-    plt.xticks(rotation=45); plt.tight_layout(); plt.show(); plt.close()
+    fig, ax = plt.subplots(figsize=PLOT_FIGSIZE, dpi=200)
+    ax.set_title("Drawdown (Long-Short)")
+    ax.plot(dd.index, dd.values)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Drawdown")
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    drawdown_path = outdir / "drawdown_long_short.png"
+    fig.savefig(drawdown_path, bbox_inches="tight")
+    print(f"Saved plot: {drawdown_path}")
+    plt.close(fig)
 
     # Rolling 12M Sharpe for L-S
     roll = returns["ls"].rolling(12)
     roll_sharpe = (np.sqrt(12) * (roll.mean()/roll.std())).dropna()
-    plt.figure(figsize=PLOT_FIGSIZE, dpi=200)
-    plt.title("Rolling 12M Sharpe (Long-Short)")
-    plt.plot(roll_sharpe.index, roll_sharpe.values)
-    plt.xlabel("Date"); plt.ylabel("Sharpe")
-    plt.xticks(rotation=45); plt.tight_layout(); plt.show(); plt.close()
+    fig, ax = plt.subplots(figsize=PLOT_FIGSIZE, dpi=200)
+    ax.set_title("Rolling 12M Sharpe (Long-Short)")
+    ax.plot(roll_sharpe.index, roll_sharpe.values)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Sharpe")
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    rolling_sharpe_path = outdir / "rolling_sharpe_long_short.png"
+    fig.savefig(rolling_sharpe_path, bbox_inches="tight")
+    print(f"Saved plot: {rolling_sharpe_path}")
+    plt.close(fig)
 
     # ---------- Save outputs ----------
-    outdir = pathlib.Path(args.output_dir); outdir.mkdir(parents=True, exist_ok=True)
     returns.to_csv(outdir / "monthly_returns.csv")
     if not top_decile_dataset.empty:
         top_decile_dataset.to_csv(outdir / "top_decile_selections.csv", index=False)
