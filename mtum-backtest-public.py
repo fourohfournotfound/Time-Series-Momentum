@@ -49,8 +49,35 @@ trading_dates = calendar.schedule(
 # =============================================================================
 # Base Point-in-Time Universe + Benchmark
 # =============================================================================
-engine = sqlalchemy.create_engine('mysql+mysqlconnector://user:pass@localhost:3306/my_database')
-universe = pd.read_sql("historical_liquid_tickers_polygon", con=engine).drop_duplicates(subset=["date", "ticker"])
+# Prefer loading the point-in-time universe from MySQL so the public script
+# retains parity with the in-house environment.  When the database is not
+# reachable (e.g. during documentation builds or on hosted notebooks) we fall
+# back to the checked-in CSV extract so that the rest of the backtest can still
+# run end-to-end.
+universe = None
+try:
+    engine = sqlalchemy.create_engine('mysql+mysqlconnector://user:pass@localhost:3306/my_database')
+    universe = pd.read_sql(
+        "historical_liquid_tickers_polygon",
+        con=engine
+    ).drop_duplicates(subset=["date", "ticker"])
+except Exception as db_error:
+    print(
+        "Warning: unable to connect to MySQL (" \
+        f"{db_error}). Falling back to local CSV extract."
+    )
+    universe = pd.read_csv("historical_liquid_tickers.csv")
+    for redundant_col in {"Unnamed: 0", "index"}:
+        if redundant_col in universe.columns:
+            universe = universe.drop(columns=[redundant_col])
+
+if universe is None:
+    raise RuntimeError("Failed to load point-in-time universe from both MySQL and CSV sources.")
+
+if "date" in universe.columns:
+    universe["date"] = pd.to_datetime(universe["date"]).dt.strftime("%Y-%m-%d")
+
+universe = universe.drop_duplicates(subset=["date", "ticker"])
 
 connection_session = requests.Session()
 connection_session.headers.update({"User-Agent": "mtum-backtest/1.0"})
