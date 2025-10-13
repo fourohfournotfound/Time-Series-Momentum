@@ -423,9 +423,10 @@ for idx in range(total_iterations):
         completed = idx + 1
         iteration = round((completed / total_iterations) * 100, 2)
         iterations_remaining = total_iterations - completed
-        avg_time = np.mean(times)
-        eta = (datetime.now() + timedelta(seconds=int(avg_time * iterations_remaining)))
-        print(f"{iteration}% complete after {month_label}, ETA ~ {eta}")
+        avg_time = float(np.mean(times)) if times else 0.0
+        eta_seconds = avg_time * iterations_remaining
+        eta_delta = timedelta(seconds=int(round(eta_seconds))) if eta_seconds else timedelta(0)
+        print(f"{iteration}% complete after {month_label}, ETA in ~ {eta_delta}")
 
     except Exception as macro_error:
         print(macro_error)
@@ -444,11 +445,16 @@ trade_list = []
 for covered_date in covered_dates:
     long_uni = top_decile_dataset[top_decile_dataset["entry_date"] == covered_date].copy()
     short_uni = bot_decile_dataset[bot_decile_dataset["entry_date"] == covered_date].copy()
-    trade_data = pd.DataFrame({
-        "date": covered_date,
-        "long": long_uni["forward_returns"].mean(),
-        "short": short_uni["forward_returns"].mean() * -1,
-    })
+    if long_uni.empty or short_uni.empty:
+        continue
+
+    trade_data = pd.DataFrame(
+        {
+            "date": [covered_date],
+            "long": [long_uni["forward_returns"].mean()],
+            "short": [short_uni["forward_returns"].mean() * -1],
+        }
+    )
     trade_list.append(trade_data)
 
 if trade_list:
