@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 import os
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 
 import mysql.connector
 import numpy as np
@@ -41,6 +42,10 @@ DB_ENGINE = sqlalchemy.create_engine(
 CSV_FALLBACK_PATH = os.getenv(
     "PIT_UNIVERSE_CSV", "historical_liquid_tickers.csv"
 )
+PICKLE_FALLBACK_PATH = os.getenv(
+    "PIT_UNIVERSE_PICKLE", "historical_liquid_tickers.pkl"
+)
+FORCE_REBUILD = os.getenv("PIT_FORCE_REBUILD", "false").lower() in {"1", "true", "yes"}
 
 
 # =============================================================================
@@ -59,8 +64,9 @@ def _calendar_bound(ts: datetime) -> pd.Timestamp:
     return stamp.tz_convert("America/New_York").tz_localize(None)
 
 
+@lru_cache(maxsize=512)
 def trading_days(start_date: datetime, end_date: datetime) -> pd.DatetimeIndex:
-    """Return NYSE trading days in New York timezone."""
+    """Return NYSE trading days in New York timezone (cached for speed)."""
 
     schedule = nyse.schedule(
         start_date=_calendar_bound(start_date),
@@ -142,6 +148,42 @@ def _get(url: str, params: dict | None = None) -> dict:
     response = session.get(url, params=params, timeout=30)
     response.raise_for_status()
     return response.json()
+
+
+def _load_existing_universe() -> pd.DataFrame:
+    """Load previously stored PIT universe rows if present."""
+
+    # Prefer database, then pickle, finally CSV.
+    try:
+        existing = pd.read_sql(
+            "SELECT as_of_date, rebalance_date, ticker, avg_days_between FROM historical_liquid_tickers_polygon",
+            con=DB_ENGINE,
+        )
+        print("Loaded existing PIT universe from database.")
+        return existing
+    except Exception:
+        pass
+
+    if os.path.exists(PICKLE_FALLBACK_PATH):
+        try:
+            existing = pd.read_pickle(PICKLE_FALLBACK_PATH)
+            print(f"Loaded existing PIT universe from {PICKLE_FALLBACK_PATH}.")
+            return existing
+        except Exception as exc:
+            print(f"[WARN] Failed to load pickle fallback ({exc}); trying CSV.")
+
+    if os.path.exists(CSV_FALLBACK_PATH):
+        try:
+            existing = pd.read_csv(
+                CSV_FALLBACK_PATH,
+                usecols=["as_of_date", "rebalance_date", "ticker", "avg_days_between"],
+            )
+            print(f"Loaded existing PIT universe from {CSV_FALLBACK_PATH}.")
+            return existing
+        except Exception as exc:
+            print(f"[WARN] Failed to load CSV fallback ({exc}); proceeding without cache.")
+
+    return pd.DataFrame(columns=["as_of_date", "rebalance_date", "ticker", "avg_days_between"])
 
 
 # =============================================================================
@@ -250,11 +292,33 @@ def _has_weekly_options(ticker: str, as_of: str) -> float | None:
 # Universe construction
 # =============================================================================
 
+existing_universe = _load_existing_universe()
+existing_universe = existing_universe.drop_duplicates(
+    subset=["as_of_date", "rebalance_date", "ticker"], keep="last"
+)
+
+skip_keys = set()
+existing_months = set()
+if not FORCE_REBUILD and not existing_universe.empty:
+    skip_keys = {
+        (
+            pd.Timestamp(row.as_of_date).strftime("%Y-%m-%d"),
+            pd.Timestamp(row.rebalance_date).strftime("%Y-%m-%d"),
+            row.ticker,
+        )
+        for row in existing_universe.itertuples(index=False)
+    }
+    existing_months = {key[:2] for key in skip_keys}
+
 rows: list[pd.DataFrame] = []
 
-for _, row in rebalance_frame.iterrows():
-    as_of = row["as_of_date_str"]
-    rebalance = row["rebalance_date_str"]
+for row in rebalance_frame.itertuples(index=False):
+    as_of = row.as_of_date_str
+    rebalance = row.rebalance_date_str
+
+    if not FORCE_REBUILD and (as_of, rebalance) in existing_months:
+        # Month already present in cache, skip expensive re-fetch.
+        continue
 
     pit_tickers = _pit_tickers(as_of)
     if pit_tickers.empty:
@@ -264,7 +328,11 @@ for _, row in rebalance_frame.iterrows():
     if liquid.empty:
         continue
 
-    for ticker in liquid["ticker"].drop_duplicates():
+    unique_tickers = liquid["ticker"].drop_duplicates()
+    for ticker in unique_tickers:
+        cache_key = (as_of, rebalance, ticker)
+        if not FORCE_REBUILD and cache_key in skip_keys:
+            continue
         try:
             avg_gap = _has_weekly_options(ticker, as_of)
         except Exception as exc:  # pragma: no cover - network guardrail
@@ -284,13 +352,28 @@ for _, row in rebalance_frame.iterrows():
         )
 
 
-if not rows:
+if rows:
+    new_universe = (
+        pd.concat(rows, ignore_index=True)
+        .drop_duplicates(subset=["as_of_date", "rebalance_date", "ticker"], keep="last")
+    )
+else:
+    new_universe = pd.DataFrame(columns=["as_of_date", "rebalance_date", "ticker", "avg_days_between"])
+    if not existing_universe.empty:
+        print("No new rebalance months detected; reusing cached universe.")
+
+if existing_universe.empty:
+    universe = new_universe
+else:
+    universe = pd.concat([existing_universe, new_universe], ignore_index=True)
+    universe = universe.drop_duplicates(
+        subset=["as_of_date", "rebalance_date", "ticker"], keep="last"
+    )
+
+if universe.empty:
     raise RuntimeError("No securities passed the PIT weekly options filters.")
 
-universe = (
-    pd.concat(rows, ignore_index=True)
-    .drop_duplicates(subset=["as_of_date", "rebalance_date", "ticker"], keep="last")
-)
+new_rows_to_persist = new_universe
 
 required_cols = ["as_of_date", "rebalance_date", "ticker", "avg_days_between"]
 if sorted(universe.columns.tolist()) != sorted(required_cols):
@@ -303,6 +386,8 @@ print("Weekly universe shape:", universe.shape)
 
 
 def _persist_to_db(df: pd.DataFrame) -> None:
+    if df.empty:
+        return
     try:
         df.to_sql(
             "historical_liquid_tickers_polygon",
@@ -311,23 +396,34 @@ def _persist_to_db(df: pd.DataFrame) -> None:
             index=False,
             method="multi",
         )
-        print("Universe written to database table 'historical_liquid_tickers_polygon'.")
+        print(
+            "Universe written to database table 'historical_liquid_tickers_polygon'."
+        )
     except Exception as exc:  # pragma: no cover - db guardrail
         print(f"[WARN] Failed to write universe to DB: {exc}")
 
 
 def _persist_to_csv(df: pd.DataFrame, path: str) -> None:
+    if df.empty:
+        return
     try:
-        if os.path.exists(path):
-            existing = pd.read_csv(path)
-            df = pd.concat([existing, df], ignore_index=True)
-            df = df.drop_duplicates(subset=["as_of_date", "rebalance_date", "ticker"], keep="last")
         df.to_csv(path, index=False)
         print(f"Universe cached to CSV at {path}.")
     except Exception as exc:  # pragma: no cover - file guardrail
         print(f"[WARN] Failed to write universe CSV: {exc}")
 
 
-_persist_to_db(universe)
+def _persist_to_pickle(df: pd.DataFrame, path: str) -> None:
+    if df.empty:
+        return
+    try:
+        df.to_pickle(path)
+        print(f"Universe cached to pickle at {path}.")
+    except Exception as exc:  # pragma: no cover - file guardrail
+        print(f"[WARN] Failed to write universe pickle: {exc}")
+
+
+_persist_to_db(new_rows_to_persist)
 _persist_to_csv(universe, CSV_FALLBACK_PATH)
+_persist_to_pickle(universe, PICKLE_FALLBACK_PATH)
 

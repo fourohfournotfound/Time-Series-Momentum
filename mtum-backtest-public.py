@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -30,6 +32,10 @@ DB_ENGINE = sqlalchemy.create_engine(
     "mysql+mysqlconnector://user:pass@localhost:3306/my_database"
 )
 CSV_FALLBACK_PATH = os.getenv("PIT_UNIVERSE_CSV", "historical_liquid_tickers.csv")
+PICKLE_FALLBACK_PATH = os.getenv("PIT_UNIVERSE_PICKLE", "historical_liquid_tickers.pkl")
+PRICE_CACHE_DIR = Path(os.getenv("MTUM_PRICE_CACHE_DIR", "data_cache"))
+PRICE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_MAX_AGE_DAYS = int(os.getenv("MTUM_CACHE_MAX_AGE_DAYS", "3"))
 
 
 # =============================================================================
@@ -55,6 +61,7 @@ def _calendar_bound(ts: datetime) -> pd.Timestamp:
     return stamp.tz_convert("America/New_York").tz_localize(None)
 
 
+@lru_cache(maxsize=512)
 def trading_days(start_date: datetime, end_date: datetime) -> pd.DatetimeIndex:
     schedule = nyse.schedule(
         start_date=_calendar_bound(start_date),
@@ -109,7 +116,9 @@ def _ensure_universe_schema(df: pd.DataFrame) -> pd.DataFrame:
             return ts.tz_localize("America/New_York")
         return ts.tz_convert("America/New_York")
 
-    def _previous_trading_day(ts: pd.Timestamp) -> pd.Timestamp:
+    @lru_cache(maxsize=1024)
+    def _previous_trading_day(ts_key: str) -> pd.Timestamp:
+        ts = pd.Timestamp(ts_key)
         window = trading_days(ts - timedelta(days=7), ts)
         past = window[window < ts]
         if len(past) == 0:
@@ -123,7 +132,7 @@ def _ensure_universe_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     if "as_of_date" not in df.columns:
         df["as_of_date"] = df["rebalance_date"].apply(
-            lambda x: _previous_trading_day(_to_ny(x)).tz_localize(None)
+            lambda x: _previous_trading_day(str(_to_ny(x))).tz_localize(None)
         )
     else:
         df["as_of_date"] = pd.to_datetime(df["as_of_date"])
@@ -143,23 +152,32 @@ def _load_universe() -> pd.DataFrame:
         df = pd.read_sql("SELECT * FROM historical_liquid_tickers_polygon", con=DB_ENGINE)
         print("Loaded PIT universe from MySQL database.")
     except Exception as exc:  # pragma: no cover - DB guardrail
-        print(f"[WARN] Unable to load universe from MySQL ({exc}). Trying CSV fallback...")
-        if not os.path.exists(CSV_FALLBACK_PATH):
-            raise RuntimeError(
-                "No PIT universe available: database unreachable and CSV fallback missing."
-            ) from exc
-        df = pd.read_csv(CSV_FALLBACK_PATH)
-        print(f"Loaded PIT universe from CSV fallback at {CSV_FALLBACK_PATH}.")
-        loaded_from_csv = True
+        print(f"[WARN] Unable to load universe from MySQL ({exc}). Trying local cache...")
+        df = None
+        if os.path.exists(PICKLE_FALLBACK_PATH):
+            try:
+                df = pd.read_pickle(PICKLE_FALLBACK_PATH)
+                print(f"Loaded PIT universe from {PICKLE_FALLBACK_PATH}.")
+            except Exception as pickle_exc:
+                print(f"[WARN] Failed to load pickle fallback ({pickle_exc}).")
+        if df is None:
+            if not os.path.exists(CSV_FALLBACK_PATH):
+                raise RuntimeError(
+                    "No PIT universe available: database unreachable and local fallbacks missing."
+                ) from exc
+            df = pd.read_csv(CSV_FALLBACK_PATH)
+            print(f"Loaded PIT universe from CSV fallback at {CSV_FALLBACK_PATH}.")
+            loaded_from_csv = True
 
     df = _ensure_universe_schema(df)
 
     if loaded_from_csv:
         try:
             df.to_csv(CSV_FALLBACK_PATH, index=False)
-            print("Normalised PIT universe cached back to CSV with latest schema.")
+            df.to_pickle(PICKLE_FALLBACK_PATH)
+            print("Normalised PIT universe cached locally with latest schema.")
         except Exception as cache_exc:  # pragma: no cover - file guardrail
-            print(f"[WARN] Failed to refresh PIT universe CSV: {cache_exc}")
+            print(f"[WARN] Failed to refresh PIT universe cache: {cache_exc}")
 
     df["as_of_date"] = pd.to_datetime(df["as_of_date"])
     df["rebalance_date"] = pd.to_datetime(df["rebalance_date"])
@@ -204,35 +222,90 @@ FORWARD_RETURN_CACHE: dict[tuple[str, str, str], float] = {}
 FEATURE_CACHE: dict[tuple[str, str], dict] = {}
 
 
+def _cache_path(ticker: str) -> Path:
+    return PRICE_CACHE_DIR / f"{ticker.upper()}_daily.pkl"
+
+
+def _cache_is_fresh(path: Path) -> bool:
+    if CACHE_MAX_AGE_DAYS < 0:
+        return True
+    max_age = timedelta(days=CACHE_MAX_AGE_DAYS)
+    modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    return datetime.now(timezone.utc) - modified <= max_age
+
+
 def _price_history(ticker: str) -> pd.DataFrame:
     key = ticker.upper()
+    required_end = pd.Timestamp(HISTORY_END)
+
     cached = PRICE_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if cached is not None and not cached.empty:
+        if pd.Timestamp(cached.index.max()) >= required_end:
+            return cached.loc[cached.index <= required_end].copy()
 
-    resp = _get(
-        f"https://api.polygon.io/v2/aggs/ticker/{key}/range/1/day/{HISTORY_START}/{HISTORY_END}",
-        params={"adjusted": "true", "sort": "asc", "limit": 50000},
-    )
-    raw = pd.json_normalize(resp.get("results", []))
-    if raw.empty:
-        df = pd.DataFrame(columns=["o", "c", "h", "l", "v", "vw"])
+    cache_path = _cache_path(key)
+    base_df: pd.DataFrame | None = None
+
+    if cache_path.exists():
+        try:
+            disk_df = pd.read_pickle(cache_path)
+            if not disk_df.empty:
+                disk_df.index = pd.to_datetime(disk_df.index)
+                base_df = disk_df.sort_index()
+                if (
+                    pd.Timestamp(base_df.index.max()) >= required_end
+                    and _cache_is_fresh(cache_path)
+                ):
+                    PRICE_CACHE[key] = base_df
+                    return base_df.loc[base_df.index <= required_end].copy()
+        except Exception as exc:
+            print(f"[WARN] Failed to read cache for {key}: {exc}")
+
+    if base_df is not None and not base_df.empty:
+        last_cached = pd.Timestamp(base_df.index.max())
+        fetch_start = last_cached + timedelta(days=1)
     else:
-        raw = raw.drop_duplicates(subset=["t"], keep="last")
-        timestamps = pd.to_datetime(raw["t"], unit="ms", utc=True).tz_convert(
-            "America/New_York"
-        )
-        raw["date"] = timestamps.tz_localize(None).normalize()
-        df = (
-            raw.dropna(subset=["date"])
-            .drop_duplicates(subset=["date"], keep="last")
-            .set_index("date")[["o", "c", "h", "l", "v", "vw"]]
-        )
-        df.index = pd.to_datetime(df.index)
-        df.sort_index(inplace=True)
+        last_cached = None
+        fetch_start = pd.Timestamp(HISTORY_START)
+        base_df = pd.DataFrame()
 
-    PRICE_CACHE[key] = df
-    return df
+    fetch_end = required_end
+    if fetch_start > fetch_end:
+        combined = base_df
+    else:
+        resp = _get(
+            f"https://api.polygon.io/v2/aggs/ticker/{key}/range/1/day/{fetch_start.strftime('%Y-%m-%d')}/{fetch_end.strftime('%Y-%m-%d')}",
+            params={"adjusted": "true", "sort": "asc", "limit": 50000},
+        )
+        raw = pd.json_normalize(resp.get("results", []))
+        if raw.empty:
+            new_df = pd.DataFrame()
+        else:
+            raw = raw.drop_duplicates(subset=["t"], keep="last")
+            timestamps = pd.to_datetime(raw["t"], unit="ms", utc=True).dt.tz_convert(
+                "America/New_York"
+            )
+            raw["date"] = timestamps.dt.tz_localize(None).normalize()
+            new_df = (
+                raw.dropna(subset=["date"])
+                .drop_duplicates(subset=["date"], keep="last")
+                .set_index("date")[["o", "c", "h", "l", "v", "vw"]]
+            )
+            new_df.index = pd.to_datetime(new_df.index)
+        combined = pd.concat([base_df, new_df], axis=0)
+
+    if combined is None or combined.empty:
+        combined = pd.DataFrame(columns=["o", "c", "h", "l", "v", "vw"])
+    else:
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+
+    try:
+        combined.to_pickle(cache_path)
+    except Exception as exc:  # pragma: no cover - file guardrail
+        print(f"[WARN] Failed to update price cache for {key}: {exc}")
+
+    PRICE_CACHE[key] = combined
+    return combined.loc[combined.index <= required_end].copy()
 
 
 SPY = _price_history("SPY")
