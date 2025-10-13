@@ -480,6 +480,7 @@ def main() -> None:
 
         # Track t-1 returns for cross-sectional peer metrics at anchor dates (computed after loop)
         returns_by_ticker: Dict[str, pd.Series] = {}
+        close_prices_by_ticker: Dict[str, pd.Series] = {}
 
         def _format_timedelta(delta: timedelta) -> str:
             total_seconds = int(delta.total_seconds())
@@ -622,48 +623,6 @@ def main() -> None:
                         composite = composite.divide(metrics["volatility"])
                     composite = composite.replace([np.inf, -np.inf], np.nan)
 
-            # --- NEW: Causal entropy features (PE/SE) per ticker ---
-            pe_name = f"perm_entropy_w{args.pe_window}_m{args.pe_m}_tau{args.pe_tau}"
-            se_name = f"spectral_entropy_w{args.se_window}"
-            entropy_quality: Optional[pd.Series] = None
-
-            if args.entropy_mode in {"pe", "se", "both", "all"}:
-                # Build a (date,ticker) MI frame for this ticker only
-                ent_df = pd.DataFrame({"closeadj": close_series})
-                ent_df["ticker"] = ticker
-                ent_df = ent_df.reset_index().set_index(["date", "ticker"]).sort_index()
-
-                ent_features = rmf.add_entropy_info_features(
-                    ent_df, price_col="closeadj",
-                    use_lagged_data=True,
-                    pe_window=args.pe_window, pe_m=args.pe_m, pe_tau=args.pe_tau,
-                    se_window=args.se_window, se_update_freq=args.se_update_freq,
-                    cs_bins=args.cs_bins, pca_window=None, verbose=False
-                )
-
-                # Pull per-ticker series back to metrics index
-                if args.entropy_mode in {"pe", "both", "all"} and pe_name in ent_features.columns:
-                    metrics[pe_name] = ent_features[pe_name].xs(ticker, level="ticker").reindex(metrics.index)
-                if args.entropy_mode in {"se", "both", "all"} and se_name in ent_features.columns:
-                    metrics[se_name] = ent_features[se_name].xs(ticker, level="ticker").reindex(metrics.index)
-
-                # Build a [0,1] "quality" (higher = more structured) from selected entropies
-                quality_components = []
-                if pe_name in metrics.columns and args.entropy_mode in {"pe", "both", "all"}:
-                    quality_components.append(1.0 - metrics[pe_name])  # low PE => high quality
-                if se_name in metrics.columns and args.entropy_mode in {"se", "both", "all"}:
-                    quality_components.append(1.0 - metrics[se_name])  # low SE => high quality
-                if quality_components:
-                    entropy_quality = pd.concat(quality_components, axis=1).mean(axis=1).clip(0.0, 1.0)
-                    metrics["entropy_quality"] = entropy_quality
-                    metrics["entropy_score"] = entropy_quality  # standalone option
-
-            # --- Apply role semantics ---
-            if args.entropy_role == "standalone" and ("entropy_score" in metrics.columns):
-                composite = metrics["entropy_score"]
-            elif args.entropy_role == "hybrid" and ("entropy_quality" in metrics.columns):
-                composite = composite * metrics["entropy_quality"]
-
             metrics["mom_score"] = composite
 
             # Align to feature anchors (strictly <= anchor date)
@@ -723,15 +682,6 @@ def main() -> None:
                     monthly_results[column] = metrics[column].to_numpy()
             if "ema_crossover" in metrics.columns:
                 monthly_results["ema_crossover"] = metrics["ema_crossover"].to_numpy()
-            if "entropy_quality" in metrics.columns:
-                monthly_results["entropy_quality"] = metrics["entropy_quality"].to_numpy()
-            if pe_name in metrics.columns:
-                monthly_results[pe_name] = metrics[pe_name].to_numpy()
-            if se_name in metrics.columns:
-                monthly_results[se_name] = metrics[se_name].to_numpy()
-            if "entropy_score" in metrics.columns:
-                monthly_results["entropy_score"] = metrics["entropy_score"].to_numpy()
-
             in_universe = np.array([ticker in universe_by_month.get(month, set()) for month in analysis_months])
             monthly_results = monthly_results[in_universe]
             monthly_results = monthly_results.dropna(
@@ -741,6 +691,7 @@ def main() -> None:
             if not monthly_results.empty:
                 monthly_results["entry_date"] = pd.to_datetime(monthly_results["entry_date"]).dt.strftime("%Y-%m-%d")
                 monthly_results["exit_date"] = pd.to_datetime(monthly_results["exit_date"]).dt.strftime("%Y-%m-%d")
+                close_prices_by_ticker[ticker] = close_series
                 all_monthly_results.append(monthly_results)
 
             completed += 1
@@ -761,6 +712,82 @@ def main() -> None:
 
         full_dataset = pd.concat(all_monthly_results, ignore_index=True)
         full_dataset = full_dataset.sort_values(["entry_date", "mom_score"], ascending=[True, False])
+
+        # Compute per-ticker entropy measures once across the full panel (if requested)
+        if args.entropy_mode in {"pe", "se", "both", "all"} and close_prices_by_ticker:
+            print("Computing entropy features across tickers...", flush=True)
+
+            pe_name = f"perm_entropy_w{args.pe_window}_m{args.pe_m}_tau{args.pe_tau}"
+            se_name = f"spectral_entropy_w{args.se_window}"
+
+            entropy_frames: List[pd.DataFrame] = []
+            for tk, prices in close_prices_by_ticker.items():
+                frame = pd.DataFrame({"date": prices.index, "closeadj": prices.values, "ticker": tk})
+                entropy_frames.append(frame)
+
+            if entropy_frames:
+                entropy_panel = pd.concat(entropy_frames, ignore_index=True)
+                entropy_panel["date"] = pd.to_datetime(entropy_panel["date"])
+                entropy_panel = entropy_panel.set_index(["date", "ticker"]).sort_index()
+
+                ent_features = rmf.add_entropy_info_features(
+                    entropy_panel,
+                    price_col="closeadj",
+                    use_lagged_data=True,
+                    pe_window=args.pe_window,
+                    pe_m=args.pe_m,
+                    pe_tau=args.pe_tau,
+                    se_window=args.se_window,
+                    se_update_freq=args.se_update_freq,
+                    cs_bins=args.cs_bins,
+                    pca_window=None,
+                    verbose=False,
+                ).sort_index()
+
+                components: List[pd.Series] = []
+                if args.entropy_mode in {"pe", "both", "all"} and pe_name in ent_features.columns:
+                    components.append(1.0 - ent_features[pe_name])
+                if args.entropy_mode in {"se", "both", "all"} and se_name in ent_features.columns:
+                    components.append(1.0 - ent_features[se_name])
+                if components:
+                    ent_quality = pd.concat(components, axis=1).mean(axis=1).clip(0.0, 1.0)
+                    ent_features["entropy_quality"] = ent_quality
+                    ent_features["entropy_score"] = ent_quality
+
+                merge_columns = [col for col in [pe_name, se_name, "entropy_quality", "entropy_score"] if col in ent_features.columns]
+                if merge_columns:
+                    anchor_dates = pd.Index(
+                        pd.to_datetime(full_dataset["anchor_date"].dropna().unique()),
+                        name="date",
+                    ).sort_values()
+                    entropy_merge_frames: List[pd.DataFrame] = []
+                    for tk in ent_features.index.get_level_values("ticker").unique():
+                        ticker_slice = ent_features.xs(tk, level="ticker")
+                        ticker_slice = ticker_slice.reindex(anchor_dates)
+                        subset = ticker_slice[merge_columns]
+                        subset = subset.reset_index().rename(columns={"date": "anchor_dt"})
+                        subset["anchor_date"] = subset["anchor_dt"].dt.strftime("%Y-%m-%d")
+                        subset["ticker"] = tk
+                        entropy_merge_frames.append(subset.drop(columns=["anchor_dt"]))
+
+                    if entropy_merge_frames:
+                        entropy_aug = pd.concat(entropy_merge_frames, ignore_index=True)
+                        full_dataset = full_dataset.merge(
+                            entropy_aug,
+                            on=["anchor_date", "ticker"],
+                            how="left",
+                        )
+
+                        if args.entropy_role == "standalone" and "entropy_score" in full_dataset.columns:
+                            full_dataset["mom_score"] = np.where(
+                                full_dataset["entropy_score"].notna(),
+                                full_dataset["entropy_score"],
+                                full_dataset["mom_score"],
+                            )
+                        elif args.entropy_role == "hybrid" and "entropy_quality" in full_dataset.columns:
+                            full_dataset["mom_score"] = full_dataset["mom_score"] * full_dataset["entropy_quality"].fillna(1.0)
+
+                print("    Entropy feature computation complete.", flush=True)
 
         # ---------- NEW: optional cross-sectional peer metrics (at anchor dates, from t-1 returns) ----------
         if args.entropy_mode in {"peer", "all"}:
