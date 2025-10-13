@@ -1,317 +1,681 @@
 # -*- coding: utf-8 -*-
+"""Monthly momentum backtest with point-in-time safeguards.
+
+This backtest mirrors the production feature pipeline by relying solely on the
+universe information known at ``as_of_date`` (the trading day before the first
+trading day of the month).  Portfolios are entered at the **next trading day
+open** following the rebalance date and exited at the **next trading day open**
+after the subsequent rebalance, ensuring signal availability precedes trade
+execution.
+
+The script also fixes the previous runtime bug encountered when the MySQL
+database is unavailable by falling back to the on-disk CSV universe cache.
 """
-Created in 2025
 
-Backtest with the same time-frames and monthly rebalancing as the QG version,
-plus optional volatility management, EWMA stats, and entropy filtering.
-
-Guarantee:
-- With METHOD="classic" and all USE_* flags False, the backtest results (top/bottom deciles,
-  long/short series, cumulative P&L) match the original.
-
-Outputs:
-- full_dataset / top_decile_dataset / bot_decile_dataset identical in structure.
-- A MultiIndex features frame (entry_date, ticker) for LTR training alignment.
-
-"""
+from __future__ import annotations
 
 import os
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import requests
-import gspread  # parity
-import sqlalchemy
-import mysql.connector
-from datetime import datetime, timedelta
-from pandas_market_calendars import get_calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from pathlib import Path
+from threading import Lock
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+import sqlalchemy
+from pandas_market_calendars import get_calendar
+
+
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3")
+USE_DATABASE = os.getenv("MTUM_USE_DATABASE", "0").lower() in {"1", "true", "yes", "y"}
+DB_ENGINE = sqlalchemy.create_engine(
+    "mysql+mysqlconnector://user:pass@localhost:3306/my_database"
+)
+CSV_FALLBACK_PATH = os.getenv("PIT_UNIVERSE_CSV", "historical_liquid_tickers.csv")
+PICKLE_FALLBACK_PATH = os.getenv("PIT_UNIVERSE_PICKLE", "historical_liquid_tickers.pkl")
+PRICE_CACHE_DIR = Path(os.getenv("MTUM_PRICE_CACHE_DIR", "data_cache"))
+PRICE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_MAX_AGE_DAYS = int(os.getenv("MTUM_CACHE_MAX_AGE_DAYS", "3"))
+MAX_WORKERS = int(
+    os.getenv(
+        "MTUM_THREADS",
+        str(
+            max(
+                1,
+                min(8, os.cpu_count() or 4),
+            )
+        ),
+    )
+)
+
 
 # =============================================================================
-# Config (same toggles as prod)
+# Calendar helpers
 # =============================================================================
 
-polygon_api_key = os.getenv("POLYGON_API_KEY", "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3")
-engine = sqlalchemy.create_engine('mysql+mysqlconnector://user:pass@localhost:3306/my_database')
+nyse = get_calendar("NYSE")
 
-METHOD = os.getenv("MTUM_METHOD", "classic")
-USE_VOL_MANAGED = (METHOD in ("vol_managed","ewma_vol_managed"))
-USE_EWMA        = (METHOD in ("ewma","ewma_vol_managed"))
-USE_ENTROPY_FILTER = bool(int(os.getenv("USE_ENTROPY_FILTER", "0")))
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(
+    pool_connections=100, pool_maxsize=500, max_retries=3
+)
+session.mount("https://", adapter)
+session.headers.update({"Accept": "application/json"})
 
-VOL_WINDOW_DAYS = int(os.getenv("VOL_WINDOW_DAYS", "21"))
-VOL_TARGET_DAILY = float(os.getenv("VOL_TARGET_DAILY", "1.0"))
-VOL_SCALE_CLIP = float(os.getenv("VOL_SCALE_CLIP", "3.0"))
-EWMA_HALFLIFE = int(os.getenv("EWMA_HALFLIFE", "21"))
 
-ENTROPY_BINS = int(os.getenv("ENTROPY_BINS", "5"))
-ENTROPY_MAX_BITS = float(os.getenv("ENTROPY_MAX_BITS", "inf"))
-ENTROPY_QCUT = bool(int(os.getenv("ENTROPY_QCUT", "1")))
+def _to_new_york(ts: datetime | pd.Timestamp) -> pd.Timestamp:
+    """Return timestamp converted to New York timezone (tz-aware)."""
 
-MAX_WORKERS = int(os.getenv("BT_MAX_WORKERS", "8"))
+    if pd.isna(ts):
+        return pd.NaT
+    stamp = pd.Timestamp(ts)
+    if stamp.tzinfo is None:
+        return stamp.tz_localize("America/New_York")
+    return stamp.tz_convert("America/New_York")
+
+
+def _calendar_bound(ts: datetime | pd.Timestamp) -> pd.Timestamp:
+    """Convert arbitrary timestamp to NYSE calendar input (tz-naive New York)."""
+
+    stamp = _to_new_york(ts)
+    return stamp.tz_localize(None)
+
+
+@lru_cache(maxsize=512)
+def trading_days(start_date: datetime, end_date: datetime) -> pd.DatetimeIndex:
+    schedule = nyse.schedule(
+        start_date=_calendar_bound(start_date),
+        end_date=_calendar_bound(end_date),
+    )
+    index = schedule.index
+    if index.tz is None:
+        index = index.tz_localize("America/New_York")
+    else:
+        index = index.tz_convert("America/New_York")
+    return index
+
+
+def next_trading_day(ts: pd.Timestamp) -> pd.Timestamp:
+    ts_local = _to_new_york(ts)
+    window = trading_days(ts_local - timedelta(days=3), ts_local + timedelta(days=7))
+    future = window[window > ts_local]
+    if len(future) == 0:
+        raise RuntimeError(f"No trading day found after {ts}")
+    return future.min()
+
+
+def _get(url: str, params: dict | None = None) -> dict:
+    params = dict(params or {})
+    params["apiKey"] = POLYGON_API_KEY
+    response = session.get(url, params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
 
 # =============================================================================
-# Date Management - Rebalancing Every Month (unchanged)
+# Universe loading
 # =============================================================================
 
-calendar = get_calendar("NYSE")
-trading_dates = calendar.schedule(start_date = "2019-01-01",
-                                  end_date   = (datetime.today() - timedelta(days=1))
-                                 ).index.strftime("%Y-%m-%d").values
+def _ensure_universe_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardise PIT universe columns for backwards compatibility."""
 
-# =============================================================================
-# PIT Universe + Benchmark (unchanged)
-# =============================================================================
+    df = df.copy()
 
-def build_session() -> requests.Session:
-    s = requests.Session()
-    adapter = HTTPAdapter(pool_connections=100, pool_maxsize=500,
-                          max_retries=Retry(total=3, backoff_factor=0.5,
-                                            status_forcelist=(429, 500, 502, 503, 504)))
-    s.mount('https://', adapter)
-    s.headers.update({"Accept":"application/json"})
-    return s
+    # Drop artefact columns from older CSV exports (e.g. pandas index column).
+    drop_candidates = [c for c in df.columns if c.startswith("Unnamed")] + ["index"]
+    df = df.drop(columns=[c for c in drop_candidates if c in df.columns], errors="ignore")
 
-session = build_session()
+    if "rebalance_date" not in df.columns and "date" in df.columns:
+        df = df.rename(columns={"date": "rebalance_date"})
 
-universe = pd.read_sql("historical_liquid_tickers_polygon", con=engine).drop_duplicates(subset=["date","ticker"])
-spy = session.get(
-    f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2017-01-01/{trading_dates[-1]}?adjusted=true&sort=asc&limit=50000&apiKey={polygon_api_key}"
-).json()
-benchmark_data = pd.json_normalize(spy.get("results", [])).set_index("t")
-benchmark_data.index = pd.to_datetime(benchmark_data.index, unit="ms", utc=True).tz_convert("America/New_York")
-benchmark_data["date"] = benchmark_data.index.strftime("%Y-%m-%d")
+    if "ticker" not in df.columns:
+        raise AssertionError("Universe missing required column: 'ticker'")
 
-# =============================================================================
-# Helpers (mirrors prod)
-# =============================================================================
+    def _to_ny(ts: pd.Timestamp) -> pd.Timestamp:
+        ts = pd.Timestamp(ts)
+        if ts.tzinfo is None:
+            return ts.tz_localize("America/New_York")
+        return ts.tz_convert("America/New_York")
 
-def shannon_entropy_bits(x: pd.Series, bins=5, qcut=True) -> float:
-    x = x.dropna().astype(float)
-    if len(x) == 0:
-        return 0.0
-    try:
-        if qcut:
-            binned = pd.qcut(x, q=bins, labels=False, duplicates="drop")
-        else:
-            binned = pd.cut(x, bins=bins, labels=False)
-        counts = np.bincount(binned.dropna().astype(int), minlength=bins).astype(float)
-        p = counts / counts.sum() if counts.sum() > 0 else counts
-        p = p[p > 0]
-        return float(-(p * np.log2(p)).sum())
-    except Exception:
-        return 0.0
+    @lru_cache(maxsize=1024)
+    def _previous_trading_day(ts_key: str) -> pd.Timestamp:
+        ts = pd.Timestamp(ts_key)
+        window = trading_days(ts - timedelta(days=7), ts)
+        past = window[window < ts]
+        if len(past) == 0:
+            raise RuntimeError(f"No prior trading day found for {ts}")
+        return past.max()
 
-def fetch_ticker_ohlc(ticker: str, start: str, end: str) -> pd.DataFrame:
-    r = session.get(
-        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
-        f"?adjusted=true&sort=asc&limit=50000&apiKey={polygon_api_key}"
-    ).json()
-    df = pd.json_normalize(r.get("results", [])).set_index("t")
-    if df.empty:
-        return df
-    df.index = pd.to_datetime(df.index, unit="ms", utc=True).tz_convert("America/New_York")
-    df["date"] = df.index.strftime("%Y-%m-%d")
+    if "rebalance_date" not in df.columns:
+        raise AssertionError("Universe missing required column: 'rebalance_date'")
+
+    df["rebalance_date"] = pd.to_datetime(df["rebalance_date"])
+
+    if "as_of_date" not in df.columns:
+        df["as_of_date"] = df["rebalance_date"].apply(
+            lambda x: _previous_trading_day(str(_to_ny(x))).tz_localize(None)
+        )
+    else:
+        df["as_of_date"] = pd.to_datetime(df["as_of_date"])
+
+    required_cols = {"as_of_date", "rebalance_date", "ticker"}
+    if not required_cols.issubset(df.columns):
+        raise AssertionError(
+            f"Universe missing required columns: {required_cols - set(df.columns)}"
+        )
+
     return df
 
-def compute_beta_sharpe_and_score(ticker_window: pd.DataFrame, bm: pd.DataFrame) -> dict:
-    merged = pd.merge(bm[["c","date"]], ticker_window[["c","date"]], on="date", how="inner")
-    merged["benchmark_pct_change"] = (merged["c_x"].pct_change() * 100).round(2).fillna(0)
-    merged["ticker_pct_change"]    = (merged["c_y"].pct_change() * 100).round(2).fillna(0)
 
-    cov = np.cov(merged["ticker_pct_change"], merged["benchmark_pct_change"])
-    beta = cov[0,1] / (np.var(merged["benchmark_pct_change"]) + 1e-12)
+def _load_universe() -> pd.DataFrame:
+    loaded_from_csv = False
+    df: pd.DataFrame | None = None
 
-    ret_period = ((merged["c_y"].iloc[-1] - merged["c_y"].iloc[0]) / merged["c_y"].iloc[0]) * 100
-    std_ann = merged["ticker_pct_change"].std() * np.sqrt(252)
-    sharpe = (ret_period / (std_ann + 1e-12))
-    theo_expected = beta * sharpe
-    return {"beta": float(beta), "sharpe": float(sharpe), "ret_12_1": float(ret_period), "mom_score_classic": float(theo_expected)}
+    if USE_DATABASE:
+        try:
+            df = pd.read_sql(
+                "SELECT * FROM historical_liquid_tickers_polygon", con=DB_ENGINE
+            )
+            print("Loaded PIT universe from MySQL database.")
+        except Exception as exc:  # pragma: no cover - DB guardrail
+            print(
+                f"[WARN] Unable to load universe from MySQL ({exc}). Falling back to local cache..."
+            )
 
-def apply_vol_management(returns_pct: pd.Series) -> pd.Series:
-    rolling_std = returns_pct.rolling(VOL_WINDOW_DAYS, min_periods=max(2, VOL_WINDOW_DAYS//2)).std()
-    if USE_EWMA:
-        ewma_std = returns_pct.ewm(halflife=EWMA_HALFLIFE, adjust=False, min_periods=2).std()
-        vol_est = ewma_std
-    else:
-        vol_est = rolling_std
-    scale = (VOL_TARGET_DAILY / (vol_est.replace(0, np.nan))).clip(upper=VOL_SCALE_CLIP).fillna(0.0)
-    return (returns_pct * scale.shift(1))  # lagged
-
-def compute_method_momscore(ticker_window: pd.DataFrame, bm: pd.DataFrame) -> dict:
-    out = compute_beta_sharpe_and_score(ticker_window, bm)
-
-    if METHOD == "classic" and not USE_VOL_MANAGED and not USE_EWMA and not USE_ENTROPY_FILTER:
-        out["mom_score"] = out["mom_score_classic"]
-        return out
-
-    merged = pd.merge(bm[["c","date"]], ticker_window[["c","date"]], on="date", how="inner").sort_values("date")
-    ret_bm = (merged["c_x"].pct_change() * 100).fillna(0)
-    ret_tk = (merged["c_y"].pct_change() * 100).fillna(0)
-
-    if USE_ENTROPY_FILTER:
-        ent_bits = shannon_entropy_bits(ret_tk, bins=ENTROPY_BINS, qcut=ENTROPY_QCUT)
-        if ent_bits > ENTROPY_MAX_BITS:
-            out["entropy_bits"] = float(ent_bits)
-            out["mom_score"] = -1e9
-            return out
-        out["entropy_bits"] = float(ent_bits)
-
-    if USE_VOL_MANAGED:
-        ret_tk = apply_vol_management(ret_tk)
-
-    if USE_EWMA:
-        mean_ann = ret_tk.ewm(halflife=EWMA_HALFLIFE, adjust=False, min_periods=2).mean().iloc[-1] * np.sqrt(252)
-        std_ann  = ret_tk.ewm(halflife=EWMA_HALFLIFE, adjust=False, min_periods=2).std().iloc[-1]  * np.sqrt(252)
-        ewma_sharpe = (mean_ann / (std_ann + 1e-12))
-        cov = np.cov((ret_tk.fillna(0)).values, (ret_bm.values))
-        beta = cov[0,1] / (np.var(ret_bm.values) + 1e-12)
-        out["mom_score"] = float(beta * ewma_sharpe)
-        out["beta"] = float(beta)
-        out["sharpe"] = float(ewma_sharpe)
-    else:
-        std_ann = ret_tk.std() * np.sqrt(252)
-        ret_period = ((merged["c_y"].iloc[-1] - merged["c_y"].iloc[0]) / merged["c_y"].iloc[0]) * 100
-        sharpe = (ret_period / (std_ann + 1e-12))
-        cov = np.cov(ret_tk.values, ret_bm.values)
-        beta = cov[0,1] / (np.var(ret_bm.values) + 1e-12)
-        out["mom_score"] = float(beta * sharpe)
-        out["beta"] = float(beta)
-        out["sharpe"] = float(sharpe)
-
-    return out
-
-# =============================================================================
-# Backtesting loop
-# =============================================================================
-
-full_data_list, top_decile_list, bot_decile_list = [], [], []
-times = []
-
-months = universe["date"].drop_duplicates().values
-
-def process_month(month: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame] | None:
-    try:
-        point_in_time_dates = np.sort(universe[universe["date"] <= month]["date"].drop_duplicates().values)
-        point_in_time_date = point_in_time_dates[-1]
-        pit = universe[universe["date"] == point_in_time_date].drop_duplicates(subset=["ticker"], keep="last")
-        tickers = pit["ticker"].drop_duplicates().values
-
-        start_date = (pd.to_datetime(month) - timedelta(days = 365+60)).strftime("%Y-%m-%d")
-        end_date = month
-        next_month_date = np.sort(months[months > month])[0]
-        last_month_date = (pd.to_datetime(month) - timedelta(days = 30)).strftime("%Y-%m-%d")
-
-        def process_ticker(tkr: str) -> pd.DataFrame | None:
+    if df is None:
+        if not USE_DATABASE:
+            print(
+                "Skipping MySQL universe load (MTUM_USE_DATABASE disabled). Using local cache."
+            )
+        if os.path.exists(PICKLE_FALLBACK_PATH):
             try:
-                data = fetch_ticker_ohlc(tkr, start_date, next_month_date)  # include forward window like original
-                if data.empty: return None
+                df = pd.read_pickle(PICKLE_FALLBACK_PATH)
+                print(f"Loaded PIT universe from {PICKLE_FALLBACK_PATH}.")
+            except Exception as pickle_exc:
+                print(f"[WARN] Failed to load pickle fallback ({pickle_exc}).")
+        if df is None:
+            if not os.path.exists(CSV_FALLBACK_PATH):
+                raise RuntimeError(
+                    "No PIT universe available: database unreachable and local fallbacks missing."
+                )
+            df = pd.read_csv(CSV_FALLBACK_PATH)
+            print(f"Loaded PIT universe from CSV fallback at {CSV_FALLBACK_PATH}.")
+            loaded_from_csv = True
 
-                twelve_minus_one = data[data["date"] < last_month_date].copy().tail(252)
-                if len(twelve_minus_one) < 252: return None
+    df = _ensure_universe_schema(df)
 
-                feat = compute_method_momscore(twelve_minus_one, benchmark_data)
+    if loaded_from_csv:
+        try:
+            df.to_csv(CSV_FALLBACK_PATH, index=False)
+            df.to_pickle(PICKLE_FALLBACK_PATH)
+            print("Normalised PIT universe cached locally with latest schema.")
+        except Exception as cache_exc:  # pragma: no cover - file guardrail
+            print(f"[WARN] Failed to refresh PIT universe cache: {cache_exc}")
 
-                # forward window: [month, next_month_date]
-                fwd = data[(data["date"] >= month) & (data["date"] <= next_month_date)].copy().sort_index()
-                next_ret = round(((fwd["c"].iloc[-1] - fwd["c"].iloc[0]) / fwd["c"].iloc[0])*100, 2)
+    def _normalise_col(series: pd.Series) -> pd.Series:
+        def _norm_value(val: object) -> pd.Timestamp:
+            if pd.isna(val):
+                return pd.NaT
+            return _to_new_york(val).tz_localize(None)
 
-                row = {
-                    "entry_date": month,
-                    "ticker": tkr,
-                    "beta": feat["beta"], "sharpe": feat["sharpe"],
-                    "12-1_return": feat["ret_12_1"], "mom_score_classic": feat["mom_score_classic"],
-                    "mom_score": feat["mom_score"],
-                    "forward_returns": next_ret, "exit_date": next_month_date
-                }
-                if "entropy_bits" in feat:
-                    row["entropy_bits"] = feat["entropy_bits"]
-                return pd.DataFrame([row])
-            except Exception as e:
-                print(e)
-                return None
+        return series.apply(_norm_value)
 
-        monthly_rows = []
-        if MAX_WORKERS > 0 and len(tickers) > 0:
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-                futs = [ex.submit(process_ticker, t) for t in tickers]
-                for f in as_completed(futs):
-                    df = f.result()
-                    if df is not None:
-                        monthly_rows.append(df)
+    df["as_of_date"] = _normalise_col(df["as_of_date"])
+    df["rebalance_date"] = _normalise_col(df["rebalance_date"])
+    return df.drop_duplicates(subset=["as_of_date", "rebalance_date", "ticker"], keep="last")
+
+
+universe = _load_universe()
+
+start_backtest = pd.Timestamp("2019-02-01")
+end_backtest = (
+    pd.Timestamp.now(tz="America/New_York") - pd.Timedelta(days=1)
+).normalize().tz_localize(None)
+
+months = (
+    universe[
+        (universe["rebalance_date"] >= start_backtest)
+        & (universe["rebalance_date"] <= end_backtest)
+    ]["rebalance_date"].drop_duplicates().sort_values().to_numpy()
+)
+
+if months.size < 2:
+    raise RuntimeError("Not enough monthly rebalances available for backtest.")
+
+
+# =============================================================================
+# Data helpers
+# =============================================================================
+
+HISTORY_START = os.getenv("MTUM_HISTORY_START", "2016-01-01")
+_history_end_env = os.getenv("MTUM_HISTORY_END")
+if _history_end_env:
+    HISTORY_END = _history_end_env
+else:
+    _last_month = pd.Timestamp(months[-1])
+    _history_end_dt = next_trading_day(_last_month).tz_convert("America/New_York").tz_localize(None)
+    HISTORY_END = (_history_end_dt + timedelta(days=7)).strftime("%Y-%m-%d")
+
+PRICE_CACHE: dict[str, pd.DataFrame] = {}
+FORWARD_RETURN_CACHE: dict[tuple[str, str, str], float] = {}
+FEATURE_CACHE: dict[tuple[str, str], dict] = {}
+
+PRICE_CACHE_LOCK = Lock()
+FEATURE_CACHE_LOCK = Lock()
+FORWARD_RETURN_CACHE_LOCK = Lock()
+_TICKER_LOCKS: dict[str, Lock] = {}
+_TICKER_LOCKS_LOCK = Lock()
+
+
+def _ticker_lock(ticker: str) -> Lock:
+    ticker = ticker.upper()
+    with _TICKER_LOCKS_LOCK:
+        lock = _TICKER_LOCKS.get(ticker)
+        if lock is None:
+            lock = Lock()
+            _TICKER_LOCKS[ticker] = lock
+        return lock
+
+
+def _cache_path(ticker: str) -> Path:
+    return PRICE_CACHE_DIR / f"{ticker.upper()}_daily.pkl"
+
+
+def _cache_is_fresh(path: Path) -> bool:
+    if CACHE_MAX_AGE_DAYS < 0:
+        return True
+    max_age = timedelta(days=CACHE_MAX_AGE_DAYS)
+    modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    return datetime.now(timezone.utc) - modified <= max_age
+
+
+def _price_history(ticker: str) -> pd.DataFrame:
+    key = ticker.upper()
+    required_end = pd.Timestamp(HISTORY_END)
+    lock = _ticker_lock(key)
+
+    with lock:
+        with PRICE_CACHE_LOCK:
+            cached = PRICE_CACHE.get(key)
+            if cached is not None and not cached.empty:
+                if pd.Timestamp(cached.index.max()) >= required_end:
+                    return cached.loc[cached.index <= required_end].copy()
+
+        cache_path = _cache_path(key)
+        base_df: pd.DataFrame | None = None
+
+        if cache_path.exists():
+            try:
+                disk_df = pd.read_pickle(cache_path)
+                if not disk_df.empty:
+                    disk_df.index = pd.to_datetime(disk_df.index)
+                    base_df = disk_df.sort_index()
+                    if (
+                        pd.Timestamp(base_df.index.max()) >= required_end
+                        and _cache_is_fresh(cache_path)
+                    ):
+                        with PRICE_CACHE_LOCK:
+                            PRICE_CACHE[key] = base_df
+                        return base_df.loc[base_df.index <= required_end].copy()
+            except Exception as exc:
+                print(f"[WARN] Failed to read cache for {key}: {exc}")
+
+        if base_df is not None and not base_df.empty:
+            last_cached = pd.Timestamp(base_df.index.max())
+            fetch_start = last_cached + timedelta(days=1)
         else:
-            for t in tickers:
-                df = process_ticker(t)
-                if df is not None:
-                    monthly_rows.append(df)
+            fetch_start = pd.Timestamp(HISTORY_START)
+            base_df = pd.DataFrame()
 
-        full_period = pd.concat(monthly_rows) if monthly_rows else pd.DataFrame(columns=[
-            "entry_date","ticker","beta","sharpe","12-1_return","mom_score_classic","mom_score","forward_returns","exit_date"
-        ])
+        fetch_end = required_end
+        if fetch_start > fetch_end:
+            combined = base_df
+        else:
+            resp = _get(
+                f"https://api.polygon.io/v2/aggs/ticker/{key}/range/1/day/{fetch_start.strftime('%Y-%m-%d')}/{fetch_end.strftime('%Y-%m-%d')}",
+                params={"adjusted": "true", "sort": "asc", "limit": 50000},
+            )
+            raw = pd.json_normalize(resp.get("results", []))
+            if raw.empty:
+                new_df = pd.DataFrame()
+            else:
+                raw = raw.drop_duplicates(subset=["t"], keep="last")
+                timestamps = pd.to_datetime(raw["t"], unit="ms", utc=True).dt.tz_convert(
+                    "America/New_York"
+                )
+                naive_timestamps = timestamps.dt.tz_localize(None)
+                raw["date"] = naive_timestamps.dt.normalize()
+                new_df = (
+                    raw.dropna(subset=["date"])
+                    .drop_duplicates(subset=["date"], keep="last")
+                    .set_index("date")[["o", "c", "h", "l", "v", "vw"]]
+                )
+                new_df.index = pd.to_datetime(new_df.index)
+            combined = pd.concat([base_df, new_df], axis=0)
 
-        # classic parity enforcement
-        if METHOD == "classic" and not USE_VOL_MANAGED and not USE_EWMA and not USE_ENTROPY_FILTER and not full_period.empty:
-            assert np.allclose(full_period["mom_score"], full_period["mom_score_classic"], rtol=1e-10, atol=1e-10)
+        if combined is None or combined.empty:
+            combined = pd.DataFrame(columns=["o", "c", "h", "l", "v", "vw"])
+        else:
+            combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+            if "c" in combined.columns and "ret" not in combined.columns:
+                combined["ret"] = combined["c"].pct_change().fillna(0.0)
 
-        top_decile = full_period.sort_values(by="mom_score", ascending=False).head(10)
-        bot_decile = full_period.sort_values(by="mom_score", ascending=True).head(10)
-        return full_period, top_decile, bot_decile
-    except Exception as e:
-        print(e)
-        return None
+        try:
+            combined.to_pickle(cache_path)
+        except Exception as exc:  # pragma: no cover - file guardrail
+            print(f"[WARN] Failed to update price cache for {key}: {exc}")
 
-# month-by-month (sequential to keep identical order; you may wrap with executor if desired)
-for month in months[:-1]:
-    start_time = datetime.now()
-    res = process_month(month)
-    if res is None: continue
-    full_period, top_decile, bot_decile = res
-    full_data_list.append(full_period)
-    top_decile_list.append(top_decile)
-    bot_decile_list.append(bot_decile)
+        with PRICE_CACHE_LOCK:
+            PRICE_CACHE[key] = combined
+        return combined.loc[combined.index <= required_end].copy()
 
-    end_time = datetime.now()
-    times.append((end_time - start_time).total_seconds())
-    iteration = round((np.where(months == month)[0][0]/len(months))*100, 2)
-    iterations_remaining = len(months) - np.where(months == month)[0][0]
-    avg_time = np.mean(times)
-    eta = (datetime.now() + timedelta(seconds=int(avg_time * iterations_remaining)))
-    remaining = eta - datetime.now()
-    print(f"{iteration}% complete, {remaining} left, ETA: {eta}")
 
-full_dataset       = pd.concat(full_data_list)
-top_decile_dataset = pd.concat(top_decile_list)
-bot_decile_dataset = pd.concat(bot_decile_list)
+SPY = _price_history("SPY")
+if SPY.empty:
+    raise RuntimeError("Unable to load SPY history for benchmarking.")
+if "ret" not in SPY.columns:
+    SPY["ret"] = SPY["c"].pct_change().fillna(0.0)
+
+
+def compute_features(ticker: str, as_of_date: pd.Timestamp) -> dict:
+    cache_key = (ticker, pd.Timestamp(as_of_date).strftime("%Y-%m-%d"))
+    with FEATURE_CACHE_LOCK:
+        cached = FEATURE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    history = _price_history(ticker)
+    if history.empty:
+        with FEATURE_CACHE_LOCK:
+            FEATURE_CACHE[cache_key] = {}
+        return {}
+
+    as_of_date = pd.Timestamp(as_of_date)
+    history = history.loc[history.index <= as_of_date].copy()
+    if history.empty:
+        with FEATURE_CACHE_LOCK:
+            FEATURE_CACHE[cache_key] = {}
+        return {}
+
+    skip_cutoff = as_of_date - timedelta(days=30)
+    window = history.loc[history.index < skip_cutoff].tail(252).copy()
+    if window.shape[0] < 252:
+        with FEATURE_CACHE_LOCK:
+            FEATURE_CACHE[cache_key] = {}
+        return {}
+
+    if "ret" not in window.columns:
+        window["ret"] = window["c"].pct_change().fillna(0.0)
+
+    spy_window = SPY.loc[
+        (SPY.index <= skip_cutoff) & (SPY.index >= window.index.min())
+    ][["c", "ret"]].copy()
+    if spy_window.empty:
+        with FEATURE_CACHE_LOCK:
+            FEATURE_CACHE[cache_key] = {}
+        return {}
+
+    merged = spy_window.rename(columns={"c": "c_m", "ret": "ret_m"}).join(
+        window[["c", "ret"]].rename(columns={"c": "c_s", "ret": "ret_s"}), how="inner"
+    )
+    if merged.shape[0] < 200:
+        with FEATURE_CACHE_LOCK:
+            FEATURE_CACHE[cache_key] = {}
+        return {}
+
+    merged["ret_m"] = merged["ret_m"].fillna(0.0)
+    merged["ret_s"] = merged["ret_s"].fillna(0.0)
+
+    cov = np.cov(merged["ret_s"], merged["ret_m"])
+    beta = 0.0 if cov[1, 1] == 0 else cov[0, 1] / cov[1, 1]
+    mom_12_1 = (window["c"].iloc[-1] / window["c"].iloc[0]) - 1.0
+
+    X = np.vstack([np.ones(len(merged["ret_m"])), merged["ret_m"].values]).T
+    y = merged["ret_s"].values
+    try:
+        coef = np.linalg.lstsq(X, y, rcond=None)[0]
+        resid = y - X @ coef
+        resid_mom = (np.prod(1.0 + resid) - 1.0)
+    except Exception:
+        resid_mom = np.nan
+
+    sigma_ann = merged["ret_s"].std() * np.sqrt(252)
+    vol_scaled = mom_12_1 / (sigma_ann + 1e-8)
+
+    result = {
+        "beta_capm": float(beta),
+        "mom_12_1": float(mom_12_1),
+        "resid_mom": float(resid_mom) if np.isfinite(resid_mom) else np.nan,
+        "sigma_ann": float(sigma_ann),
+        "mom_vol_scaled": float(vol_scaled),
+    }
+    with FEATURE_CACHE_LOCK:
+        FEATURE_CACHE[cache_key] = result
+    return result
+
+
+def forward_open_to_open(ticker: str, entry_rebalance: pd.Timestamp, exit_rebalance: pd.Timestamp) -> float:
+    entry_rebalance = pd.Timestamp(entry_rebalance)
+    exit_rebalance = pd.Timestamp(exit_rebalance)
+
+    cache_key = (
+        ticker,
+        entry_rebalance.strftime("%Y-%m-%d"),
+        exit_rebalance.strftime("%Y-%m-%d"),
+    )
+    with FORWARD_RETURN_CACHE_LOCK:
+        cached = FORWARD_RETURN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    history = _price_history(ticker)
+    if history.empty:
+        FORWARD_RETURN_CACHE[cache_key] = np.nan
+        return np.nan
+
+    def _to_ny(ts: pd.Timestamp) -> pd.Timestamp:
+        ts = pd.Timestamp(ts)
+        if ts.tzinfo is None:
+            return ts.tz_localize("America/New_York")
+        return ts.tz_convert("America/New_York")
+
+    def _normalize(ts: pd.Timestamp) -> pd.Timestamp:
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("America/New_York").tz_localize(None)
+        return ts.normalize()
+
+    entry_trade_day = _normalize(next_trading_day(_to_ny(entry_rebalance)))
+    exit_trade_day = _normalize(next_trading_day(_to_ny(exit_rebalance)))
+    entry_rebalance_day = _normalize(_to_ny(entry_rebalance))
+    exit_rebalance_day = _normalize(_to_ny(exit_rebalance))
+
+    try:
+        price_entry = float(history.at[entry_trade_day, "o"])
+        price_exit = float(history.at[exit_trade_day, "o"])
+    except KeyError:
+        try:
+            price_entry = float(history.at[entry_rebalance_day, "c"])
+            price_exit = float(history.at[exit_rebalance_day, "c"])
+        except KeyError:
+            with FORWARD_RETURN_CACHE_LOCK:
+                FORWARD_RETURN_CACHE[cache_key] = np.nan
+            return np.nan
+
+    forward_return = float((price_exit / price_entry) - 1.0) * 100.0
+    with FORWARD_RETURN_CACHE_LOCK:
+        FORWARD_RETURN_CACHE[cache_key] = forward_return
+    return forward_return
+
+
+def _batch_forward_returns(
+    tickers: list[str],
+    entry_rebalance: pd.Timestamp,
+    exit_rebalance: pd.Timestamp,
+) -> dict[str, float]:
+    if not tickers:
+        return {}
+
+    workers = max(1, min(MAX_WORKERS, len(tickers)))
+    results: dict[str, float] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_ticker = {
+            executor.submit(forward_open_to_open, ticker, entry_rebalance, exit_rebalance): ticker
+            for ticker in tickers
+        }
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                results[ticker] = future.result()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                print(f"[WARN] Forward return failed for {ticker}: {exc}")
+                results[ticker] = np.nan
+    return results
+
 
 # =============================================================================
-# Backtest (identical arithmetic; plotting preserved)
+# Backtest loop
 # =============================================================================
 
-covered_dates = full_dataset["entry_date"].drop_duplicates().values
-trade_list = []
-for d in covered_dates:
-    long_uni  = top_decile_dataset[top_decile_dataset["entry_date"] == d].copy()
-    short_uni = bot_decile_dataset[bot_decile_dataset["entry_date"] == d].copy()
-    trade_list.append(pd.DataFrame([{
-        "date": d,
-        "long":  long_uni["forward_returns"].mean(),
-        "short": short_uni["forward_returns"].mean() * -1
-    }]))
+feature_panels: list[pd.DataFrame] = []
+monthly_returns: list[dict] = []
 
-all_trades = pd.concat(trade_list)
-all_trades["long_pnl"]  = all_trades["long"].cumsum()
-all_trades["short_pnl"] = all_trades["short"].cumsum()
-all_trades["portfolio_pnl"] = all_trades["long_pnl"] + all_trades["short_pnl"]
+for month_value in months[:-1]:
+    month_ts = pd.Timestamp(month_value)
+    next_month_idx = np.where(months > month_value)[0]
+    if len(next_month_idx) == 0:
+        break
+    next_month_ts = pd.Timestamp(months[next_month_idx[0]])
+
+    month_universe = universe[universe["rebalance_date"] == month_ts]
+    if month_universe.empty:
+        continue
+    as_of_date = pd.Timestamp(month_universe["as_of_date"].iloc[0])
+
+    tickers = month_universe["ticker"].drop_duplicates().tolist()
+    feature_rows = []
+    if tickers:
+        workers = max(1, min(MAX_WORKERS, len(tickers)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_ticker = {
+                executor.submit(compute_features, ticker, as_of_date): ticker
+                for ticker in tickers
+            }
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    feats = future.result()
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    print(f"[WARN] Feature computation failed for {ticker}: {exc}")
+                    continue
+                if not feats:
+                    continue
+                feature_rows.append(
+                    {
+                        "entry_date": month_ts.strftime("%Y-%m-%d"),
+                        "as_of_date": as_of_date.strftime("%Y-%m-%d"),
+                        "ticker": ticker,
+                        **feats,
+                    }
+                )
+
+    if not feature_rows:
+        continue
+
+    feature_df = pd.DataFrame(feature_rows).set_index(["entry_date", "ticker"])
+    feature_df["rank_score"] = feature_df["mom_vol_scaled"].where(
+        np.isfinite(feature_df["mom_vol_scaled"]),
+        np.nan,
+    )
+    feature_df["rank_score"] = feature_df["rank_score"].fillna(
+        feature_df["resid_mom"]
+    )
+    feature_df["rank_score"] = feature_df["rank_score"].fillna(
+        feature_df["mom_12_1"]
+    )
+    feature_df = feature_df.sort_values("rank_score", ascending=False)
+
+    top_decile = feature_df.groupby(level=0).head(10).reset_index()
+    bottom_decile = feature_df.groupby(level=0).tail(10).reset_index()
+
+    spy_forward = forward_open_to_open("SPY", month_ts, next_month_ts)
+    forward_rows = []
+    forward_map = _batch_forward_returns(
+        sorted(
+            set(top_decile["ticker"].tolist())
+            | set(bottom_decile["ticker"].tolist())
+        ),
+        month_ts,
+        next_month_ts,
+    )
+
+    for side, data in (("long", top_decile), ("short", bottom_decile)):
+        for _, row in data.iterrows():
+            fwd = forward_map.get(row["ticker"], np.nan)
+            if np.isnan(fwd):
+                continue
+            beta = feature_df.loc[(row["entry_date"], row["ticker"]), "beta_capm"]
+            risk_adj = fwd - beta * spy_forward
+            forward_rows.append(
+                {
+                    "date": row["entry_date"],
+                    "ticker": row["ticker"],
+                    "side": side,
+                    "forward_return_pct": fwd,
+                    "risk_adj_forward_pct": risk_adj,
+                }
+            )
+
+    if not forward_rows:
+        continue
+
+    forward_df = pd.DataFrame(forward_rows)
+    long_mean = forward_df[forward_df["side"] == "long"]["risk_adj_forward_pct"].mean()
+    short_mean = -forward_df[forward_df["side"] == "short"]["risk_adj_forward_pct"].mean()
+
+    monthly_returns.append(
+        {
+            "date": month_ts.strftime("%Y-%m-%d"),
+            "long": long_mean,
+            "short": short_mean,
+        }
+    )
+
+    feature_panels.append(feature_df.reset_index())
+
+
+if not monthly_returns:
+    raise RuntimeError("Backtest produced no tradable months.")
+
+features_panel = pd.concat(feature_panels, ignore_index=True).set_index(["entry_date", "ticker"]).sort_index()
+monthly_returns_df = pd.DataFrame(monthly_returns).sort_values("date")
+
+monthly_returns_df["long_pnl"] = monthly_returns_df["long"].cumsum()
+monthly_returns_df["short_pnl"] = monthly_returns_df["short"].cumsum()
+monthly_returns_df["long_short_pnl"] = monthly_returns_df["long_pnl"] + monthly_returns_df["short_pnl"]
+
+print("Backtest months:", monthly_returns_df.shape[0])
+print(monthly_returns_df.tail())
+
+
+# =============================================================================
+# Plot performance
+# =============================================================================
 
 plt.figure(figsize=(10, 6), dpi=200)
+plt.suptitle("Gross Cumulative Performance (Risk-Adjusted, Open→Open)")
+plt.plot(pd.to_datetime(monthly_returns_df["date"]), monthly_returns_df["long_pnl"], label="Top Decile")
+plt.plot(pd.to_datetime(monthly_returns_df["date"]), monthly_returns_df["short_pnl"], label="Bottom Decile")
+plt.plot(
+    pd.to_datetime(monthly_returns_df["date"]),
+    monthly_returns_df["long_short_pnl"],
+    label="Long-Short",
+)
 plt.xticks(rotation=45)
-plt.suptitle("Gross Cumulative Performance")
-plt.title("Monthly Rebalancing")
-plt.plot(pd.to_datetime(all_trades["date"]), all_trades["long_pnl"])
-plt.plot(pd.to_datetime(all_trades["date"]), all_trades["short_pnl"])
-plt.plot(pd.to_datetime(all_trades["date"]), all_trades["portfolio_pnl"])
-plt.legend(["Top Decile", "Bottom Decile", "Long-Short"])
-plt.xlabel("Date"); plt.ylabel("Cumulative % Returns")
-plt.show(); plt.close()
+plt.xlabel("Date")
+plt.ylabel("Cumulative % Returns")
+plt.legend()
+plt.tight_layout()
+plt.show()
