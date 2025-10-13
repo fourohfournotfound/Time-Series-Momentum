@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pandas_market_calendars import get_calendar
 
-from custom_relative_market_features import add_entropy_info_features, ewm_moments, latest_per_ticker
+from relative_market_features import add_entropy_info_features, ewm_moments, latest_per_ticker
 
 # -------------------- CONFIG --------------------
 polygon_api_key = os.getenv("POLYGON_API_KEY", "KkfCQ7fsZnx0yK4bhX9fD81QplTh0Pf3")
@@ -197,3 +197,4 @@ print("Top 10:")
 print(top_decile[["ticker", "mom_score"]])
 print("Bottom 10:")
 print(bot_decile[["ticker", "mom_score"]])
+
