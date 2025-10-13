@@ -12,6 +12,9 @@ scripts. All functions:
 Key exports:
   - add_entropy_info_features(...): PE/SE + peer surprisal & JSD (optional PCA mix entropy).
   - add_relative_to_market(...): simple causal market-return & shrunk beta example.
+  - ewm_moments(...): per-ticker causal EWMA mean/vol (t-1).
+  - volatility_target_scale(...): per-ticker causal volatility target scaler (t-1).
+  - latest_per_ticker(...): pick last valid pre-cutoff value per (ticker).
 
 Notes:
   • Permutation entropy (PE) and spectral entropy (SE) are normalized to [0,1].
@@ -169,6 +172,7 @@ def _sliding_permutation_entropy(
     min_patterns: int = 20,
     normalize: bool = True,
 ) -> np.ndarray:
+    # ... (unchanged implementation) ...
     n = x.size
     H = np.empty(n, dtype=np.float64)
     H.fill(np.nan)
@@ -263,6 +267,7 @@ def _rolling_spectral_entropy(
     nfft: Optional[int] = None,
     normalize: bool = True,
 ) -> np.ndarray:
+    # ... (unchanged implementation) ...
     n = x.size
     H = np.full(n, np.nan, dtype=np.float64)
     if n == 0 or window <= 4:
@@ -302,8 +307,8 @@ def _cross_sectional_surprisal_from_bins(
     n_bins: int = 21,
     q_low: float = 0.01,
     q_high: float = 0.99,
-) -> Tuple[pd.Series, pd.Series, np.ndarray]:
-    """Causal per-date cross-sectional surprisal at date t using r[t-1]."""
+):
+    # ... (unchanged implementation) ...
     if r_lag.empty:
         return (
             pd.Series(np.nan, index=r_lag.index),
@@ -353,7 +358,7 @@ def _peer_jsd_pointmass(
     q_low: float = 0.01,
     q_high: float = 0.99,
 ) -> pd.Series:
-    """Causal Jensen–Shannon divergence between a point mass at r_i[t-1] and cross-section."""
+    # ... (unchanged implementation) ...
     if r_lag.empty:
         return pd.Series(np.nan, index=r_lag.index, name=f"peer_jsd_bins{n_bins}")
     assert isinstance(r_lag.index, pd.MultiIndex) and "date" in r_lag.index.names and "ticker" in r_lag.index.names
@@ -415,7 +420,7 @@ def _pca_factor_mix_entropy(
     update_freq: int = 5,
     min_valid_ratio: float = 0.6,
 ) -> pd.DataFrame:
-    """Optional ‘factor mix entropy’: diversity of top eigenvectors in trailing corr."""
+    # ... (unchanged implementation) ...
     all_dates = panel.index.to_numpy()
     out_frames = []
     start = window
@@ -533,10 +538,63 @@ def add_entropy_info_features(
     return out
 
 
+# ---------------------------
+# NEW: Causal EWMA & Vol-target helpers (LTR-safe)
+# ---------------------------
+
+def ewm_moments(
+    df: pd.DataFrame,
+    ret_col: str = "returns",
+    halflife: int = 63,
+    use_lagged_data: bool = True,
+) -> pd.DataFrame:
+    """Per-ticker EWMA mean & vol (annualized) of returns at t-1 if use_lagged_data."""
+    assert isinstance(df.index, pd.MultiIndex) and df.index.names == ["date", "ticker"]
+    s = df[ret_col].astype(float)
+    def _per_ticker(x: pd.Series) -> pd.DataFrame:
+        m = x.ewm(halflife=halflife, adjust=False, min_periods=max(10, halflife//2)).mean()
+        v = x.ewm(halflife=halflife, adjust=False, min_periods=max(10, halflife//2)).var()
+        if use_lagged_data:
+            m = m.shift(1)
+            v = v.shift(1)
+        out = pd.DataFrame({"ewm_mean": m, "ewm_vol_ann": np.sqrt(v) * np.sqrt(252.0)})
+        return out
+    out = s.groupby(level="ticker", group_keys=False).apply(_per_ticker)
+    return out
+
+def volatility_target_scale(
+    df: pd.DataFrame,
+    vol_col: str = "ewm_vol_ann",
+    target_vol: float = 0.2,
+    cap: float = 3.0,
+) -> pd.Series:
+    """Scale factor per row to hit target annualized vol; clipped to [0, cap]."""
+    v = df[vol_col].astype(float).replace(0.0, np.nan)
+    scale = target_vol / (v + 1e-8)
+    return scale.clip(lower=0.0, upper=cap).fillna(0.0)
+
+def latest_per_ticker(
+    df: pd.DataFrame,
+    cutoff_date: pd.Timestamp,
+    cols: List[str],
+) -> pd.DataFrame:
+    """Select last available row <= cutoff_date for each ticker, return DataFrame[ticker, cols]."""
+    assert isinstance(df.index, pd.MultiIndex) and df.index.names == ["date", "ticker"]
+    sub = df.loc[pd.IndexSlice[:cutoff_date, :], cols].copy()
+    # For each ticker pick last valid row
+    last_idx = sub.groupby(level="ticker").tail(1)
+    # index: (date,ticker) -> we want index=ticker
+    last_idx = last_idx.reset_index(level="date", drop=False)
+    last_idx = last_idx.reset_index().set_index("ticker")
+    return last_idx
+
 __all__ = [
     "validate_relative_features",
     "add_relative_to_market",
     "add_entropy_info_features",
+    "ewm_moments",
+    "volatility_target_scale",
+    "latest_per_ticker",
     "_cross_sectional_surprisal_from_bins",
     "_peer_jsd_pointmass",
 ]
