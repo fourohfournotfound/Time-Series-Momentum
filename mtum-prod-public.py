@@ -25,7 +25,7 @@ import mysql.connector
 from datetime import datetime, timedelta
 from pandas_market_calendars import get_calendar
 
-from custom_relative_market_features import (
+from relative_market_features import (
     add_entropy_info_features, ewm_moments, latest_per_ticker
 )
 
@@ -282,3 +282,4 @@ print(top_decile[["ticker", "mom_score"]])
 
 print("Bottom 10 (by score):")
 print(bot_decile[["ticker", "mom_score"]])
+
