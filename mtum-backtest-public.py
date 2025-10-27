@@ -153,6 +153,46 @@ def _vol_overlay_leverage(
     return leverage.clip(upper=cap)
 
 
+def _cumulative_return_path(returns: np.ndarray) -> np.ndarray:
+    """Convert periodic returns into cumulative returns."""
+    if returns.size == 0:
+        return np.array([], dtype=float)
+    return np.cumprod(1.0 + returns.astype(float)) - 1.0
+
+
+def _performance_metrics(returns: pd.Series, *, periods_per_year: int) -> Dict[str, float]:
+    """Compute performance statistics for a return series."""
+    if returns.empty:
+        return {"annualized_return": float("nan"), "sortino": float("nan"), "omega": float("nan"), "max_drawdown": float("nan")}
+
+    compounded = (1.0 + returns).cumprod()
+    if len(compounded) == 0 or compounded.iloc[-1] <= 0:
+        annualised_return = float("nan")
+    else:
+        years = max(len(returns) / max(periods_per_year, 1), 1e-9)
+        annualised_return = compounded.iloc[-1] ** (1.0 / years) - 1.0
+
+    downside = np.sqrt((np.minimum(returns, 0.0) ** 2).mean()) * math.sqrt(periods_per_year)
+    annualised_mean = returns.mean() * periods_per_year
+    sortino = float("nan") if downside == 0 else annualised_mean / downside
+
+    gains = np.clip(returns, a_min=0.0, a_max=None).sum()
+    losses = np.clip(-returns, a_min=0.0, a_max=None).sum()
+    omega = float("inf") if losses == 0 and gains > 0 else (float("nan") if losses == 0 else gains / losses)
+
+    cumulative = (1.0 + returns).cumprod()
+    running_max = cumulative.cummax()
+    drawdowns = cumulative.divide(running_max, fill_value=np.nan) - 1.0
+    max_drawdown = drawdowns.min()
+
+    return {
+        "annualized_return": annualised_return,
+        "sortino": sortino,
+        "omega": omega,
+        "max_drawdown": float(max_drawdown) if not math.isnan(max_drawdown) else float("nan"),
+    }
+
+
 def _load_colab_user_secrets() -> None:
     """Populate environment variables from Colab user secrets when available."""
     try:
@@ -752,8 +792,8 @@ def main() -> None:
         ls_returns_net = ls_returns - cost_decimals
 
         overlay_returns = None
+        periods_per_year = max(int(round(args.annualization_factor / max(SKIP_BDAYS, 1))), 1)
         if args.vol_overlay:
-            periods_per_year = max(int(round(args.annualization_factor / max(SKIP_BDAYS, 1))), 1)
             leverage_series = _vol_overlay_leverage(
                 pd.Series(ls_returns, index=trades_dates, dtype=float),
                 halflife=args.vol_overlay_halflife,
@@ -764,19 +804,44 @@ def main() -> None:
             overlay_returns = ls_returns * leverage_series.to_numpy() - cost_decimals * leverage_series.to_numpy()
             all_trades["vol_overlay_leverage"] = leverage_series.to_numpy()
 
-        all_trades["long_nav"] = np.cumprod(1.0 + long_returns)
-        all_trades["short_nav"] = np.cumprod(1.0 + short_returns)
-        all_trades["ls_nav"] = np.cumprod(1.0 + ls_returns)
-        all_trades["ls_nav_net"] = np.cumprod(1.0 + ls_returns_net)
+        all_trades["long_cumulative_return"] = _cumulative_return_path(long_returns)
+        all_trades["short_cumulative_return"] = _cumulative_return_path(short_returns)
+        all_trades["ls_cumulative_return"] = _cumulative_return_path(ls_returns)
+        all_trades["ls_cumulative_return_net"] = _cumulative_return_path(ls_returns_net)
         if overlay_returns is not None:
-            all_trades["ls_nav_vol_managed"] = np.cumprod(1.0 + overlay_returns)
+            all_trades["ls_cumulative_return_vol_managed"] = _cumulative_return_path(overlay_returns)
 
-        all_trades["long_cum_%"] = (all_trades["long_nav"] - 1.0) * 100.0
-        all_trades["short_cum_%"] = (all_trades["short_nav"] - 1.0) * 100.0
-        all_trades["ls_cum_%"] = (all_trades["ls_nav"] - 1.0) * 100.0
-        all_trades["ls_cum_%_net"] = (all_trades["ls_nav_net"] - 1.0) * 100.0
+        all_trades["long_cum_%"] = all_trades["long_cumulative_return"] * 100.0
+        all_trades["short_cum_%"] = all_trades["short_cumulative_return"] * 100.0
+        all_trades["ls_cum_%"] = all_trades["ls_cumulative_return"] * 100.0
+        all_trades["ls_cum_%_net"] = all_trades["ls_cumulative_return_net"] * 100.0
         if overlay_returns is not None:
-            all_trades["ls_cum_%_vol_managed"] = (all_trades["ls_nav_vol_managed"] - 1.0) * 100.0
+            all_trades["ls_cum_%_vol_managed"] = all_trades["ls_cumulative_return_vol_managed"] * 100.0
+
+        net_returns_series = pd.Series(ls_returns_net, index=trades_dates, dtype=float)
+        net_metrics = _performance_metrics(net_returns_series, periods_per_year=periods_per_year)
+        print("\nPerformance metrics (long-short net):")
+        for label, value in net_metrics.items():
+            if math.isnan(value):
+                display = "nan"
+            elif math.isinf(value):
+                display = "inf"
+            else:
+                display = f"{value:.4f}"
+            print(f"  {label.replace('_', ' ').title()}: {display}")
+
+        if overlay_returns is not None:
+            overlay_series = pd.Series(overlay_returns, index=trades_dates, dtype=float)
+            overlay_metrics = _performance_metrics(overlay_series, periods_per_year=periods_per_year)
+            print("\nPerformance metrics (long-short vol managed):")
+            for label, value in overlay_metrics.items():
+                if math.isnan(value):
+                    display = "nan"
+                elif math.isinf(value):
+                    display = "inf"
+                else:
+                    display = f"{value:.4f}"
+                print(f"  {label.replace('_', ' ').title()}: {display}")
 
         plt.figure(figsize=(10, 6), dpi=200)
         plt.xticks(rotation=45)
